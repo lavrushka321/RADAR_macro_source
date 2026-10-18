@@ -159,9 +159,7 @@ shared_data: Dict[str, Any] = {
     "tracking_mode": False,
     "screen_center": (win32api.GetSystemMetrics(0) // 2, win32api.GetSystemMetrics(1) // 2),
     "targets": [],
-    "targets_ttl": {}, 
     "main_target": None,
-    "main_target_ttl": 0.0,
 
     "thermal_active": False,
     "thermal_prev_frame": None,
@@ -383,8 +381,6 @@ class Overlay(QMainWindow):
             "width": SQUARE_SIZE,
             "height": SQUARE_SIZE,
         }
-        mon["top"] = max(0, my - SQUARE_SIZE // 2)
-        mon["left"] = max(0, mx - SQUARE_SIZE // 2)
 
         img1 = np.array(self.sct.grab(mon))
         gray1 = cv2.cvtColor(img1, cv2.COLOR_BGRA2GRAY)
@@ -408,7 +404,7 @@ class Overlay(QMainWindow):
         return targets, cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
 
     # -------- главный цикл --------
-    
+
     def logic_tick(self) -> None:
         # Скрыть / показать
         if shared_data.pop("hide_toggle_request", False):
@@ -438,42 +434,18 @@ class Overlay(QMainWindow):
             shared_data["active"] = True
             try:
                 targets, display_frame = self.scan_targets()
-                now = time.time()
-                ttl = shared_data["targets_ttl"]
-
-                # обновляем/добавляем увиденные цели
-                for r in targets:
-                    # склеиваем близкие bbox, чтобы одна цель не дублировалась из-за дрожания
-                    merged = False
-                    for old_r in list(ttl.keys()):
-                        if _rects_close(old_r, r, tol=25):
-                            ttl.pop(old_r, None)
-                            ttl[r] = now
-                            merged = True
-                            break
-                    if not merged:
-                        ttl[r] = now
-
-                # чистим протухшие (250 мс)
-                for r, t in list(ttl.items()):
-                    if now - t > 0.25:
-                        del ttl[r]
-
-                shared_data["targets"] = list(ttl.keys())
-
-                if shared_data["targets"]:
-                    # главная — ближайшая к центру экрана, а не самая большая
-                    cx, cy = shared_data["screen_center"]
-                    def _dist(r):
-                        return (r[0] + r[2]//2 - cx)**2 + (r[1] + r[3]//2 - cy)**2
-                    shared_data["main_target"] = min(shared_data["targets"], key=_dist)
-                    shared_data["main_target_ttl"] = now
-                else:
-                    shared_data["main_target"] = None
+                shared_data["targets"] = targets
+                if targets:
+                    main = max(targets, key=lambda r: r[2] * r[3])
+                    shared_data["main_target"] = main
+                    if shared_data["tracking_mode"]:
+                        self.execute_tracking(main)
             except Exception:
                 pass
         else:
             shared_data["active"] = False
+            shared_data["targets"] = []
+            shared_data["main_target"] = None
 
         self._draw_radar_status(display_frame)
         cv2.imshow("RADAR_VIEW", display_frame)
@@ -487,12 +459,6 @@ class Overlay(QMainWindow):
             )
 
         self.update()
-
-    def _rects_close(a, b, tol=25):
-        ax, ay, aw, ah = a
-        bx, by, bw, bh = b
-        return (abs(ax - bx) <= tol and abs(ay - by) <= tol
-                and abs(aw - bw) <= tol and abs(ah - bh) <= tol)
 
     @staticmethod
     def _draw_radar_status(frame: np.ndarray) -> None:
@@ -534,28 +500,21 @@ class Overlay(QMainWindow):
         if not shared_data["active"] or self.is_hidden:
             return
 
-        now = time.time()
-        ttl = shared_data.get("targets_ttl", {})
-        live = {r: t for r, t in ttl.items() if now - t <= 0.25}
-
-        if not live:
-            return
-
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
+        mx, my = win32api.GetCursorPos()
+        painter.setPen(QPen(QColor(0, 255, 0, 80), 1))
+        painter.drawEllipse(mx - SQUARE_SIZE // 2, my - SQUARE_SIZE // 2, SQUARE_SIZE, SQUARE_SIZE)
 
-        for rect, last_seen in live.items():
+        for rect in shared_data["targets"]:
             rx, ry, rw, rh = rect
-            is_main = rect == shared_data.get("main_target")
+            is_main = rect == shared_data["main_target"]
             color = QColor(255, 0, 0) if is_main else QColor(255, 140, 0)
-
-            # плавное затухание по мере старения цели
-            age = now - last_seen
-            alpha = int(255 * max(0.0, 1.0 - age / 0.25))
-
-            c = QColor(color.red(), color.green(), color.blue(), alpha)
-            painter.setPen(QPen(c, 2 if is_main else 1))
+            painter.setPen(QPen(color, 2 if is_main else 1))
             painter.drawRect(rx, ry, rw, rh)
+
+            cx, cy = shared_data["screen_center"]
+            painter.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 60), 3, Qt.DashLine))
+            painter.drawLine(cx, cy, rx + rw // 2, ry + rh // 2)
 
 
 # ==================== THERMAL OVERLAY ====================

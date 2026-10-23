@@ -27,7 +27,7 @@ from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PyQt5.QtWidgets import QApplication, QMainWindow
 
 
-__version__ = "beta-2.6 (local)"
+__version__ = "beta-2.8 (local)"
 
 RADAR_WINDOW_TITLE = "RADAR_VIEW"
 
@@ -53,7 +53,10 @@ enable_dpi_awareness()
 CONFIG_DIR = Path.home() / ".radar_macro"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+CONFIG_VERSION = 3
+
 DEFAULT_SETTINGS: Dict[str, Any] = {
+    "CONFIG_VERSION": CONFIG_VERSION,
     "SQUARE_SIZE": 400,
     "SCAN_INTERVAL": 0.05,
     "SHOW_RADAR_VIEW": True,
@@ -66,9 +69,16 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
             "threshold": 7,
             "dilate": 15,
             "blur": 0,
+            "open": 0,
+            "min_seed": 0,
             "min_area": 0,
             "max_area": 10000,
+            "min_fill": 0.0,
+            "max_aspect": 0.0,
+            "max_motion_ratio": 1.0,
+            "adaptive": False,
             "min_hits": 1,
+            "max_misses": 0,
             "match_dist": 0,
         },
         "noise": {
@@ -76,9 +86,24 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
             "threshold": 20,
             "dilate": 21,
             "blur": 3,
+            # Убирает одиночные пиксели шума до дилатации, чтобы они не
+            # склеивались в крупные ложные блобы.
+            "open": 3,
+            "min_seed": 30,
             "min_area": 120,
             "max_area": 8000,
+            # Плотность контура и вытянутость: трава/ветки дают тонкие
+            # и разреженные блобы, цель — компактный.
+            "min_fill": 0.2,
+            "max_aspect": 4.0,
+            # При повороте камеры меняется почти весь кадр — пропускаем такой
+            # скан, чтобы не сыпать ложными целями.
+            "max_motion_ratio": 0.85,
+            # Порог автоматически поднимается на подвижном фоне.
+            "adaptive": True,
             "min_hits": 3,
+            # Один пропущенный скан не сбрасывает подтверждение цели.
+            "max_misses": 1,
             "match_dist": 48,
         },
     },
@@ -94,6 +119,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "key_thermal": "Q",
         "key_tracking": "V",
         "key_profile": "G",
+        "key_zoom": "Z",
         "key_exit": "ESCAPE",
         "key_hide": "Ё",
     },
@@ -168,11 +194,22 @@ def _validate_profiles(cfg: Dict[str, Any]) -> None:
         profile["threshold"] = _as_int(profile.get("threshold"), base["threshold"], 1, 255)
         profile["dilate"] = _as_odd(profile.get("dilate"), base["dilate"], 1, 51)
         profile["blur"] = _as_odd(profile.get("blur"), base["blur"], 0, 21)
+        profile["open"] = _as_odd(profile.get("open"), base["open"], 0, 15)
+        profile["min_seed"] = _as_int(profile.get("min_seed"), base["min_seed"], 0, 100000)
+        profile["min_fill"] = round(_as_float(profile.get("min_fill"), base["min_fill"], 0.0, 1.0), 2)
+        profile["max_aspect"] = round(
+            _as_float(profile.get("max_aspect"), base["max_aspect"], 0.0, 20.0), 2
+        )
+        profile["max_motion_ratio"] = round(
+            _as_float(profile.get("max_motion_ratio"), base["max_motion_ratio"], 0.0, 1.0), 2
+        )
+        profile["adaptive"] = bool(profile.get("adaptive", base["adaptive"]))
         profile["min_area"] = _as_int(profile.get("min_area"), base["min_area"], 0, 100000)
         profile["max_area"] = _as_int(profile.get("max_area"), base["max_area"], 1, 1000000)
         if profile["max_area"] <= profile["min_area"]:
             profile["max_area"] = profile["min_area"] + 100
         profile["min_hits"] = _as_int(profile.get("min_hits"), base["min_hits"], 1, 15)
+        profile["max_misses"] = _as_int(profile.get("max_misses"), base["max_misses"], 0, 10)
         profile["match_dist"] = _as_int(profile.get("match_dist"), base["match_dist"], 0, 1000)
 
 
@@ -192,6 +229,7 @@ def _validate_binds(cfg: Dict[str, Any]) -> None:
 
 
 def _validate_config(cfg: Dict[str, Any]) -> None:
+    cfg["CONFIG_VERSION"] = CONFIG_VERSION
     cfg["SQUARE_SIZE"] = _as_int(cfg.get("SQUARE_SIZE"), 400, 64, 2000)
     cfg["SCAN_INTERVAL"] = _as_float(cfg.get("SCAN_INTERVAL"), 0.05, 0.005, 0.5)
     cfg["SHOW_RADAR_VIEW"] = bool(cfg.get("SHOW_RADAR_VIEW", True))
@@ -248,6 +286,19 @@ def load_config() -> Dict[str, Any]:
                     shutil.copy2(CONFIG_FILE, CONFIG_FILE.with_name(CONFIG_FILE.name + ".bad"))
                 except OSError:
                     pass
+
+    # Миграция формата профилей. В версии 3 профиль "noise" получил
+    # адаптивный порог, открытие, фильтры формы и допуск пропущенных сканов —
+    # старые значения заменяем новыми дефолтами. Профиль precision не трогаем.
+    try:
+        raw_version = int(raw.get("CONFIG_VERSION", 0))
+    except (TypeError, ValueError):
+        raw_version = 0
+    if raw_version < CONFIG_VERSION:
+        profiles = raw.get("SEARCH_PROFILES")
+        if isinstance(profiles, dict) and "noise" in profiles:
+            profiles["noise"] = copy.deepcopy(DEFAULT_SETTINGS["SEARCH_PROFILES"]["noise"])
+        raw["CONFIG_VERSION"] = CONFIG_VERSION
 
     # Старый конфиг без профилей: переносим его значения в профиль "precision",
     # чтобы поведение после обновления не изменилось.
@@ -374,6 +425,7 @@ VK_SCAN = _bind("key_scan", "F")
 VK_THERMAL = _bind("key_thermal", "Q")
 VK_TRACK = _bind("key_tracking", "V")
 VK_PROFILE = _bind("key_profile", "G")
+VK_ZOOM = _bind("key_zoom", "Z")
 VK_EXIT = _bind("key_exit", "ESCAPE")
 VK_HIDE = _bind("key_hide", "Ё")
 
@@ -381,7 +433,7 @@ BIND_LABELS: Dict[str, str] = {
     name: str(_binds_cfg.get(f"key_{name}", default)).upper()
     for name, default in (
         ("scan", "F"), ("thermal", "Q"), ("tracking", "V"),
-        ("profile", "G"), ("exit", "ESCAPE"), ("hide", "Ё"),
+        ("profile", "G"), ("zoom", "Z"), ("exit", "ESCAPE"), ("hide", "Ё"),
     )
 }
 
@@ -497,15 +549,17 @@ def find_roblox_hwnd() -> Optional[int]:
     own_pid = os.getpid()
 
     def _callback(hwnd: int, _param: Any) -> bool:
-        if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
-            return True
+        # Окно может исчезнуть между EnumWindows и проверкой — не роняем
+        # перечисление из-за одного такого окна.
         try:
+            if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+                return True
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if pid == own_pid:
+                return True
+            title = win32gui.GetWindowText(hwnd).lower()
         except Exception:
             return True
-        if pid == own_pid:
-            return True
-        title = win32gui.GetWindowText(hwnd).lower()
         if not title:
             return True
         for needle in THERMAL_WINDOWS:
@@ -584,11 +638,13 @@ class TargetTracker:
     """Подтверждает цели по нескольким кадрам (защита от помех).
 
     Режим "precision" (min_hits=1) отдаёт всё сразу, режим "noise" требует,
-    чтобы объект стабильно появлялся рядом на нескольких сканах.
+    чтобы объект стабильно появлялся рядом на нескольких сканах. Допускается
+    ``max_misses`` пропущенных сканов подряд: цель может мигнуть/пропасть на
+    кадре, но прогресс подтверждения не сбрасывается.
     """
 
     def __init__(self) -> None:
-        self._hits: List[Tuple[Rect, int]] = []
+        self._hits: List[Tuple[Rect, int, int]] = []
 
     @staticmethod
     def _center(rect: Rect) -> Tuple[int, int]:
@@ -597,27 +653,31 @@ class TargetTracker:
     def update(self, rects: List[Rect], profile: Dict[str, Any]) -> List[Rect]:
         required = max(1, int(profile.get("min_hits", 1)))
         if required <= 1:
-            self._hits = [(rect, 1) for rect in rects[:200]]
+            self._hits = [(rect, 1, 0) for rect in rects[:200]]
             return list(rects)
 
         max_dist = max(16, int(profile.get("match_dist", 0)))
+        max_misses = max(0, int(profile.get("max_misses", 0)))
         used = [False] * len(rects)
         confirmed: List[Rect] = []
-        next_hits: List[Tuple[Rect, int]] = []
+        next_hits: List[Tuple[Rect, int, int]] = []
 
-        for old_rect, hits in self._hits:
+        for old_rect, hits, misses in self._hits:
             index = self._find_match(old_rect, rects, used, max_dist)
             if index is None:
+                misses += 1
+                if misses <= max_misses and hits > 0:
+                    next_hits.append((old_rect, hits, misses))
                 continue
             used[index] = True
             hits += 1
-            next_hits.append((rects[index], hits))
+            next_hits.append((rects[index], hits, 0))
             if hits >= required:
                 confirmed.append(rects[index])
 
         for index, rect in enumerate(rects):
             if not used[index]:
-                next_hits.append((rect, 1))
+                next_hits.append((rect, 1, 0))
 
         self._hits = next_hits[:200]
         return confirmed
@@ -636,6 +696,84 @@ class TargetTracker:
             if dist <= best_dist:
                 best, best_dist = index, dist
         return best
+
+
+def analyze_motion(
+    diff: np.ndarray, profile: Dict[str, Any]
+) -> List[Tuple[int, int, int, int]]:
+    """Ищет цели по карте разницы кадров.
+
+    Возвращает прямоугольники в координатах переданной карты (без смещения
+    на экран). Вся настройка берётся из профиля:
+
+    - ``threshold``/``blur`` — базовая чувствительность;
+    - ``adaptive`` — порог поднимается на подвижном фоне (поворот камеры),
+      но никогда не опускается ниже базового;
+    - ``max_motion_ratio`` — если изменилась слишком большая часть кадра,
+      скан пропускается (это поворот камеры, а не цель);
+    - ``open`` — убирает одиночные пиксели шума до дилатации;
+    - ``min_seed`` — минимальная площадь пятна до дилатации (мелкие пятна
+      не разрастаются в ложные блобы);
+    - ``min_area``/``max_area``/``min_fill``/``max_aspect`` — фильтры блоба.
+    """
+    blur = int(profile.get("blur", 0))
+    if blur > 1:
+        diff = cv2.GaussianBlur(diff, (blur, blur), 0)
+
+    threshold = int(profile["threshold"])
+    if profile.get("adaptive"):
+        # 98-й процентиль отражает фон, а не маленькую цель: на спокойном
+        # кадре он низкий и порог остаётся базовым, на подвижном — растёт.
+        high = float(np.percentile(diff, 98))
+        threshold = max(threshold, min(255, int(high * 0.5)))
+
+    _, thresh = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
+
+    motion_ratio = cv2.countNonZero(thresh) / float(thresh.size)
+    if motion_ratio > float(profile.get("max_motion_ratio", 1.0)):
+        return []
+
+    open_size = int(profile.get("open", 0))
+    if open_size > 1:
+        thresh = cv2.morphologyEx(
+            thresh, cv2.MORPH_OPEN, np.ones((open_size, open_size), dtype=np.uint8)
+        )
+
+    # Отсекаем слишком маленькие «семена» до дилатации: иначе одно пятно
+    # шума после расширения на 21 px превращается в блоб, проходящий min_area.
+    min_seed = int(profile.get("min_seed", 0))
+    if min_seed > 0:
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(thresh, connectivity=8)
+        keep = stats[:, cv2.CC_STAT_AREA] >= min_seed
+        keep[0] = False
+        lut = np.zeros(count, dtype=np.uint8)
+        lut[keep] = 255
+        thresh = lut[labels]
+
+    kernel_size = int(profile["dilate"])
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    closed = cv2.morphologyEx(cv2.dilate(thresh, kernel), cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    min_area = int(profile["min_area"])
+    max_area = int(profile["max_area"])
+    min_fill = float(profile.get("min_fill", 0.0))
+    max_aspect = float(profile.get("max_aspect", 0.0))
+
+    targets: List[Tuple[int, int, int, int]] = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if not (min_area < area < max_area):
+            continue
+        tx, ty, tw, th = cv2.boundingRect(contour)
+        if tw <= 0 or th <= 0:
+            continue
+        if min_fill > 0.0 and area / float(tw * th) < min_fill:
+            continue
+        if max_aspect > 0.0 and max(tw, th) / float(min(tw, th)) > max_aspect:
+            continue
+        targets.append((tx, ty, tw, th))
+    return targets
 
 
 class ScanWorker(threading.Thread):
@@ -773,25 +911,8 @@ class ScanWorker(threading.Thread):
         motion[y0 - top:y1 - top, x0 - left:x1 - left] = raw
 
         diff = raw
-        blur = int(profile.get("blur", 0))
-        if blur > 1:
-            diff = cv2.GaussianBlur(diff, (blur, blur), 0)
-
-        _, thresh = cv2.threshold(diff, int(profile["threshold"]), 255, cv2.THRESH_BINARY)
-        kernel_size = int(profile["dilate"])
-        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-        closed = cv2.morphologyEx(cv2.dilate(thresh, kernel), cv2.MORPH_CLOSE, kernel)
-
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        min_area = int(profile["min_area"])
-        max_area = int(profile["max_area"])
-
         targets: List[Rect] = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if not (min_area < area < max_area):
-                continue
-            tx, ty, tw, th = cv2.boundingRect(contour)
+        for tx, ty, tw, th in analyze_motion(diff, profile):
             targets.append((origin[0] + x0 + tx, origin[1] + y0 + ty, tw, th))
         return targets, motion
 
@@ -912,6 +1033,7 @@ class Overlay(QMainWindow):
         self._next_view = 0.0
         self._next_topmost = 0.0
         self._radar_hwnd: Optional[int] = None
+        self._radar_zoom = False
         self._track_next = 0.0
         self._thermal_overlay: Optional[ThermalOverlay] = None
 
@@ -962,8 +1084,40 @@ class Overlay(QMainWindow):
             cv2.namedWindow(RADAR_WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
             self._radar_hwnd = None
             self._next_topmost = 0.0
+            self._apply_radar_window_size()
         except Exception as exc:
             print(f"[view] restore: {exc}")
+
+    def toggle_radar_zoom(self) -> None:
+        """Включает/выключает увеличение окна RADAR_VIEW в 2 раза."""
+        self._radar_zoom = not self._radar_zoom
+        self._next_view = 0.0
+        self._apply_radar_window_size()
+        print(f"[view] zoom x{2 if self._radar_zoom else 1}")
+
+    def _apply_radar_window_size(self) -> None:
+        """Подгоняет окно RADAR_VIEW под текущий масштаб и держит его на экране."""
+        if self.is_hidden or not config.get("SHOW_RADAR_VIEW", True):
+            return
+        size = SQUARE_SIZE * (2 if self._radar_zoom else 1)
+        try:
+            cv2.resizeWindow(RADAR_WINDOW_TITLE, size, size)
+            hwnd = win32gui.FindWindow(None, RADAR_WINDOW_TITLE)
+            if not hwnd:
+                return
+            self._radar_hwnd = hwnd
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            sw = win32api.GetSystemMetrics(0)
+            sh = win32api.GetSystemMetrics(1)
+            x, y = left, top
+            if right > sw:
+                x = max(0, sw - (right - left))
+            if bottom > sh:
+                y = max(0, sh - (bottom - top))
+            if (x, y) != (left, top):
+                cv2.moveWindow(RADAR_WINDOW_TITLE, x, y)
+        except Exception:
+            pass
 
     # -------- наведение --------
 
@@ -1071,6 +1225,8 @@ class Overlay(QMainWindow):
             self.toggle_thermal()
         if keys.just_pressed(VK_PROFILE):
             self.cycle_profile()
+        if keys.just_pressed(VK_ZOOM):
+            self.toggle_radar_zoom()
         self._handle_thermal_hotkeys()
 
     # -------- главный цикл --------
@@ -1134,7 +1290,13 @@ class Overlay(QMainWindow):
                     cv2.resize(scaled, (SQUARE_SIZE, SQUARE_SIZE)), cv2.COLOR_GRAY2BGR
                 )
 
-        self._draw_radar_status(frame, active, len(targets))
+        self._draw_radar_status(frame, active, len(targets), self._radar_zoom)
+        if self._radar_zoom:
+            # Увеличиваем уже готовый кадр целиком: карта, перекрестие и
+            # подписи растут вместе с окном, пиксели остаются чёткими.
+            frame = cv2.resize(
+                frame, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_NEAREST
+            )
         try:
             cv2.imshow(RADAR_WINDOW_TITLE, frame)
             cv2.waitKey(1)
@@ -1160,7 +1322,9 @@ class Overlay(QMainWindow):
             self._next_topmost = now + 1.0
 
     @staticmethod
-    def _draw_radar_status(frame: np.ndarray, active: bool, targets_count: int) -> None:
+    def _draw_radar_status(
+        frame: np.ndarray, active: bool, targets_count: int, zoomed: bool = False
+    ) -> None:
         h, w = frame.shape[:2]
         font = cv2.FONT_HERSHEY_SIMPLEX
         cx, cy = w // 2, h // 2
@@ -1178,6 +1342,13 @@ class Overlay(QMainWindow):
             f"MOTION MAP x{int(config.get('MOTION_MAP_GAIN', 8))} (raw, before masks)",
             (10, 38), font, 0.4, (180, 180, 180), 1,
         )
+        zoom_color = (0, 255, 0) if zoomed else (128, 128, 128)
+        cv2.putText(
+            frame,
+            f"ZOOM x{2 if zoomed else 1} [{CV2_BIND_LABELS['zoom']}]: "
+            f"{'ON' if zoomed else 'OFF'}",
+            (10, 56), font, 0.4, zoom_color, 1,
+        )
 
         if not active:
             cv2.putText(
@@ -1187,12 +1358,12 @@ class Overlay(QMainWindow):
             cv2.putText(
                 frame,
                 f"[{CV2_BIND_LABELS['tracking']}] track  [{CV2_BIND_LABELS['thermal']}] thermal  "
-                f"[{CV2_BIND_LABELS['hide']}] hide  [ESC] exit",
-                (10, h - 10), font, 0.4, (128, 128, 128), 1,
+                f"[{CV2_BIND_LABELS['zoom']}] zoom  [{CV2_BIND_LABELS['hide']}] hide  [ESC] exit",
+                (10, h - 10), font, 0.37, (128, 128, 128), 1,
             )
             return
 
-        y = 58
+        y = 76
         track_color = (0, 255, 0) if shared_data["tracking_mode"] else (128, 128, 128)
         cv2.putText(
             frame, f"TRACKING [{CV2_BIND_LABELS['tracking']}]: "

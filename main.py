@@ -27,7 +27,7 @@ from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PyQt5.QtWidgets import QApplication, QMainWindow
 
 
-__version__ = "beta-2.8 (local)"
+__version__ = "beta-2.9 (local)"
 
 RADAR_WINDOW_TITLE = "RADAR_VIEW"
 
@@ -107,6 +107,18 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
             "match_dist": 48,
         },
     },
+    # Ручной захват по шаблону внешнего вида (работает, даже если радар
+    # не нашёл цель). Шаблон ищется только рядом с прошлой позицией и
+    # переживает короткие перекрытия (трассеры, вспышки).
+    "LOCK_SETTINGS": {
+        "template_size": 48,
+        "search_margin": 40,
+        "wide_margin": 120,
+        "match_min": 0.45,
+        "wide_match_min": 0.60,
+        "max_misses": 8,
+        "update_score": 0.85,
+    },
     "THERMAL_SETTINGS": {
         "threshold": 7,
         "dot_size": 1,
@@ -120,6 +132,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "key_tracking": "V",
         "key_profile": "G",
         "key_zoom": "Z",
+        "key_capture": "T",
         "key_exit": "ESCAPE",
         "key_hide": "Ё",
     },
@@ -234,6 +247,24 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
     cfg["SCAN_INTERVAL"] = _as_float(cfg.get("SCAN_INTERVAL"), 0.05, 0.005, 0.5)
     cfg["SHOW_RADAR_VIEW"] = bool(cfg.get("SHOW_RADAR_VIEW", True))
     cfg["MOTION_MAP_GAIN"] = _as_int(cfg.get("MOTION_MAP_GAIN"), 8, 1, 32)
+
+    lock = cfg.get("LOCK_SETTINGS")
+    if not isinstance(lock, dict):
+        lock = copy.deepcopy(DEFAULT_SETTINGS["LOCK_SETTINGS"])
+        cfg["LOCK_SETTINGS"] = lock
+    lock["template_size"] = _as_int(lock.get("template_size"), 48, 16, 160)
+    lock["search_margin"] = _as_int(lock.get("search_margin"), 40, 8, 300)
+    lock["wide_margin"] = _as_int(lock.get("wide_margin"), 120, 8, 500)
+    if lock["wide_margin"] < lock["search_margin"]:
+        lock["wide_margin"] = lock["search_margin"]
+    lock["match_min"] = round(_as_float(lock.get("match_min"), 0.45, 0.05, 0.95), 2)
+    lock["wide_match_min"] = round(
+        _as_float(lock.get("wide_match_min"), 0.60, 0.05, 0.99), 2
+    )
+    if lock["wide_match_min"] < lock["match_min"]:
+        lock["wide_match_min"] = lock["match_min"]
+    lock["max_misses"] = _as_int(lock.get("max_misses"), 8, 0, 60)
+    lock["update_score"] = round(_as_float(lock.get("update_score"), 0.85, 0.5, 0.99), 2)
 
     _validate_profiles(cfg)
     profiles = cfg["SEARCH_PROFILES"]
@@ -395,6 +426,7 @@ config: Dict[str, Any] = load_config()
 SQUARE_SIZE = int(config["SQUARE_SIZE"])
 SCAN_INTERVAL = float(config["SCAN_INTERVAL"])
 THERMAL_SETTINGS: Dict[str, int] = config["THERMAL_SETTINGS"].copy()
+LOCK_SETTINGS: Dict[str, Any] = config["LOCK_SETTINGS"].copy()
 THERMAL_WINDOWS: List[str] = list(config["THERMAL_WINDOWS"])
 active_profile: str = str(config["ACTIVE_PROFILE"])
 
@@ -426,6 +458,7 @@ VK_THERMAL = _bind("key_thermal", "Q")
 VK_TRACK = _bind("key_tracking", "V")
 VK_PROFILE = _bind("key_profile", "G")
 VK_ZOOM = _bind("key_zoom", "Z")
+VK_CAPTURE = _bind("key_capture", "T")
 VK_EXIT = _bind("key_exit", "ESCAPE")
 VK_HIDE = _bind("key_hide", "Ё")
 
@@ -433,14 +466,24 @@ BIND_LABELS: Dict[str, str] = {
     name: str(_binds_cfg.get(f"key_{name}", default)).upper()
     for name, default in (
         ("scan", "F"), ("thermal", "Q"), ("tracking", "V"),
-        ("profile", "G"), ("zoom", "Z"), ("exit", "ESCAPE"), ("hide", "Ё"),
+        ("profile", "G"), ("zoom", "Z"), ("capture", "T"),
+        ("exit", "ESCAPE"), ("hide", "Ё"),
     )
 }
 
 # cv2.putText не умеет кириллицу — для окна RADAR_VIEW и thermal-оверлея
-# держим ASCII-вариант подписей.
+# держим ASCII-вариант подписей. Ё — рабочая клавиша скрытия, поэтому
+# показываем её транслитерацией, а не вопросительным знаком.
+def _cv2_label(label: str) -> str:
+    if label == "Ё":
+        return "YO"
+    if label == "ё":
+        return "yo"
+    return label.encode("ascii", "replace").decode()
+
+
 CV2_BIND_LABELS: Dict[str, str] = {
-    name: label.encode("ascii", "replace").decode() for name, label in BIND_LABELS.items()
+    name: _cv2_label(label) for name, label in BIND_LABELS.items()
 }
 
 
@@ -474,6 +517,7 @@ shared_data: Dict[str, Any] = {
     "screen_center": (0, 0),
     "targets": [],
     "main_target": None,
+    "lock_target": None,
     "thermal_active": False,
 }
 
@@ -794,6 +838,16 @@ class ScanWorker(threading.Thread):
         self._prev_gray: Optional[np.ndarray] = None
         self._prev_origin: Optional[Tuple[int, int]] = None
 
+        # Ручной захват: шаблон внешнего вида + последняя позиция в координатах
+        # клиентской области окна. Живёт независимо от детектора движения.
+        self._manual_template: Optional[np.ndarray] = None
+        self._manual_center: Tuple[float, float] = (0.0, 0.0)
+        self._manual_velocity: Tuple[float, float] = (0.0, 0.0)
+        self._manual_misses = 0
+        self._manual_score = 0.0
+        self._manual_rect: Optional[Rect] = None
+        self._manual_generation = 0
+
     def configure(
         self,
         profile: Optional[Dict[str, Any]] = None,
@@ -822,10 +876,39 @@ class ScanWorker(threading.Thread):
                 self._targets = []
                 self._main = None
                 self._motion = None
+                # Шаблон не теряем: после повторного F цель можно добрать
+                # широким поиском, но старую рамку и скорость сбрасываем.
+                self._manual_rect = None
+                self._manual_misses = 0
+                self._manual_velocity = (0.0, 0.0)
 
-    def snapshot(self) -> Tuple[List[Rect], Optional[Rect], Optional[np.ndarray]]:
+    def set_manual_lock(self, template: np.ndarray, center: Tuple[int, int]) -> None:
+        """Захватить цель по шаблону из точки под курсором."""
         with self._lock:
-            return self._targets, self._main, self._motion
+            self._manual_template = template.copy()
+            self._manual_center = (float(center[0]), float(center[1]))
+            self._manual_velocity = (0.0, 0.0)
+            self._manual_misses = 0
+            self._manual_score = 1.0
+            self._manual_rect = None
+            self._manual_generation += 1
+
+    def clear_manual_lock(self) -> None:
+        with self._lock:
+            self._manual_template = None
+            self._manual_rect = None
+            self._manual_score = 0.0
+            self._manual_generation += 1
+
+    def has_manual_lock(self) -> bool:
+        with self._lock:
+            return self._manual_template is not None
+
+    def snapshot(
+        self,
+    ) -> Tuple[List[Rect], Optional[Rect], Optional[np.ndarray], Optional[Rect]]:
+        with self._lock:
+            return self._targets, self._main, self._motion, self._manual_rect
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -886,6 +969,10 @@ class ScanWorker(threading.Thread):
         self._prev_gray = gray
         self._prev_origin = origin
 
+        # Ручной захват ведётся по полному кадру окна и не зависит от того,
+        # попала ли цель в квадрат радара или в детектор движения.
+        self._update_manual_lock(gray, origin)
+
         client_h, client_w = gray.shape
         mx, my = win32api.GetCursorPos()
         half = size // 2
@@ -915,6 +1002,131 @@ class ScanWorker(threading.Thread):
         for tx, ty, tw, th in analyze_motion(diff, profile):
             targets.append((origin[0] + x0 + tx, origin[1] + y0 + ty, tw, th))
         return targets, motion
+
+    # -------- ручной захват --------
+
+    @staticmethod
+    def _patch_at(
+        gray: np.ndarray, center: Tuple[float, float], tw: int, th: int
+    ) -> Optional[np.ndarray]:
+        h, w = gray.shape
+        if tw > w or th > h:
+            return None
+        left = max(0, min(w - tw, int(round(center[0] - tw / 2.0))))
+        top = max(0, min(h - th, int(round(center[1] - th / 2.0))))
+        return gray[top:top + th, left:left + tw].copy()
+
+    @staticmethod
+    def _match_template(
+        gray: np.ndarray,
+        template: np.ndarray,
+        center: Tuple[float, float],
+        margin: int,
+    ) -> Optional[Tuple[Tuple[float, float], float]]:
+        h, w = gray.shape
+        th, tw = template.shape[:2]
+        if w < tw or h < th:
+            return None
+        left = max(0, int(round(center[0] - tw / 2.0 - margin)))
+        top = max(0, int(round(center[1] - th / 2.0 - margin)))
+        right = min(w, int(round(center[0] + tw / 2.0 + margin)) + 1)
+        bottom = min(h, int(round(center[1] + th / 2.0 + margin)) + 1)
+        if right - left < tw or bottom - top < th:
+            return None
+        result = cv2.matchTemplate(gray[top:bottom, left:right], template, cv2.TM_CCOEFF_NORMED)
+        result = np.nan_to_num(result, nan=-1.0, posinf=1.0, neginf=-1.0)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        matched = (
+            left + max_loc[0] + tw / 2.0,
+            top + max_loc[1] + th / 2.0,
+        )
+        return matched, float(max_val)
+
+    def _update_manual_lock(self, gray: np.ndarray, origin: Tuple[int, int]) -> None:
+        """Ведёт цель по шаблону, переживая короткие перекрытия (трассеры).
+
+        Локальный поиск идёт только рядом с предсказанной позицией, поэтому
+        посторонний яркий блоб не может «украсть» захват. Если шаблон пропал,
+        несколько сканов курсор ведётся по последней скорости (coast), затем
+        делается более широкий поиск с повышенным порогом.
+        """
+        with self._lock:
+            template = self._manual_template
+            if template is None:
+                return
+            center = self._manual_center
+            velocity = self._manual_velocity
+            misses = self._manual_misses
+            generation = self._manual_generation
+
+        th, tw = template.shape[:2]
+        frame_h, frame_w = gray.shape
+        if tw > frame_w or th > frame_h:
+            with self._lock:
+                if generation == self._manual_generation:
+                    self._manual_template = None
+                    self._manual_rect = None
+            return
+
+        predicted = (center[0] + velocity[0], center[1] + velocity[1])
+        settings = LOCK_SETTINGS
+        match = self._match_template(
+            gray, template, predicted, int(settings["search_margin"])
+        )
+        accepted = match is not None and match[1] >= float(settings["match_min"])
+
+        if not accepted and misses % 2 == 0:
+            # Широкий поиск не каждый скан: он дороже, а нужен только когда
+            # цель резко сместилась или её кратко перекрыли.
+            wide = self._match_template(
+                gray, template, predicted, int(settings["wide_margin"])
+            )
+            if (
+                wide is not None
+                and wide[1] >= float(settings["wide_match_min"])
+                and (match is None or wide[1] > match[1] + 0.05)
+            ):
+                match = wide
+                accepted = True
+
+        if accepted and match is not None:
+            new_center, score = match
+            velocity = (
+                0.5 * velocity[0] + 0.5 * (new_center[0] - center[0]),
+                0.5 * velocity[1] + 0.5 * (new_center[1] - center[1]),
+            )
+            misses = 0
+            # Обновляем шаблон только при уверенном совпадении, чтобы трассер
+            # или вспышка не «впечатались» в эталон.
+            if score >= float(settings["update_score"]):
+                patch = self._patch_at(gray, new_center, tw, th)
+                if patch is not None:
+                    template = cv2.addWeighted(template, 0.8, patch, 0.2, 0)
+        else:
+            misses += 1
+            new_center = predicted
+            score = match[1] if match is not None else 0.0
+            velocity = (velocity[0] * 0.9, velocity[1] * 0.9)
+
+        if misses > int(settings["max_misses"]):
+            template = None
+            rect: Optional[Rect] = None
+            score = 0.0
+        else:
+            left = max(0, min(frame_w - tw, int(round(new_center[0] - tw / 2.0))))
+            top = max(0, min(frame_h - th, int(round(new_center[1] - th / 2.0))))
+            new_center = (left + tw / 2.0, top + th / 2.0)
+            rect = (origin[0] + left, origin[1] + top, tw, th)
+
+        with self._lock:
+            if generation != self._manual_generation:
+                return
+            self._manual_template = template
+            self._manual_center = new_center
+            self._manual_velocity = velocity
+            self._manual_misses = misses
+            self._manual_score = score
+            self._manual_rect = rect
 
 # ==================== ТЕПЛОВИЗОР (ПОТОК) ====================
 
@@ -1037,6 +1249,11 @@ class Overlay(QMainWindow):
         self._track_next = 0.0
         self._thermal_overlay: Optional[ThermalOverlay] = None
 
+        # Ручной захват (хардлок): помним, было ли слежение V включено до него.
+        # Если захват сам включил V, после снятия/срыва вернём его в OFF.
+        self._lock_tracking_before = False
+        self._manual_lock_owned = False
+
         self.scanner = ScanWorker()
         self.scanner.configure(profile=get_profile(), size=SQUARE_SIZE, interval=SCAN_INTERVAL)
         self.scanner.start()
@@ -1061,6 +1278,7 @@ class Overlay(QMainWindow):
             shared_data["thermal_active"] = False
             shared_data["targets"] = []
             shared_data["main_target"] = None
+            self.clear_manual_lock()
             self.scanner.set_active(False)
             self.thermal_worker.set_active(False)
             if self._thermal_overlay is not None:
@@ -1153,6 +1371,58 @@ class Overlay(QMainWindow):
         save_config()
         print(f"[profile] {get_profile()['title']}")
 
+    # -------- ручной захват --------
+
+    def toggle_manual_lock(self) -> None:
+        """Захват цели под курсором по внешнему виду (без детекта движения)."""
+        if self.scanner.has_manual_lock():
+            self._finish_manual_lock("released")
+            return
+
+        captured = capture_roblox_window()
+        if captured is None:
+            print("[lock] окно Roblox не найдено")
+            return
+
+        gray, origin = captured
+        size = int(LOCK_SETTINGS["template_size"])
+        mx, my = win32api.GetCursorPos()
+        h, w = gray.shape
+        left = int(round(mx - origin[0] - size / 2.0))
+        top = int(round(my - origin[1] - size / 2.0))
+        if left < 0 or top < 0 or left + size > w or top + size > h:
+            print("[lock] курсор вне окна Roblox")
+            return
+
+        patch = gray[top:top + size, left:left + size].copy()
+        if float(patch.std()) < 2.0:
+            print("[lock] область слишком однородная — наведите на цель")
+            return
+
+        # Запоминаем состояние V до захвата: если слежение было выключено,
+        # после снятия или срыва захвата вернём его в OFF.
+        self._lock_tracking_before = bool(shared_data["tracking_mode"])
+        self._manual_lock_owned = True
+        self.scanner.set_manual_lock(patch, (left + size / 2.0, top + size / 2.0))
+        # При ручном захвате сразу включаем слежение: цель может быть не
+        # найдена радаром, но вестись по шаблону она всё равно будет.
+        shared_data["tracking_mode"] = True
+        print(f"[lock] target captured ({size}x{size})")
+
+    def _finish_manual_lock(self, reason: str) -> None:
+        """Снимает захват и восстанавливает слежение, если оно было выключено."""
+        restore_off = not self._lock_tracking_before
+        self.clear_manual_lock()
+        if restore_off:
+            shared_data["tracking_mode"] = False
+        print(f"[lock] {reason}")
+
+    def clear_manual_lock(self) -> None:
+        self.scanner.clear_manual_lock()
+        shared_data["lock_target"] = None
+        self._lock_tracking_before = False
+        self._manual_lock_owned = False
+
     # -------- thermal --------
 
     def toggle_thermal(self) -> None:
@@ -1220,6 +1490,8 @@ class Overlay(QMainWindow):
             return
 
         if keys.just_pressed(VK_TRACK):
+            # V управляет только слежением: ручной захват (LOCK) остаётся,
+            # чтобы его можно было выключить/включить при активном хардлоке.
             shared_data["tracking_mode"] = not shared_data["tracking_mode"]
         if keys.just_pressed(VK_THERMAL):
             self.toggle_thermal()
@@ -1227,6 +1499,8 @@ class Overlay(QMainWindow):
             self.cycle_profile()
         if keys.just_pressed(VK_ZOOM):
             self.toggle_radar_zoom()
+        if keys.just_pressed(VK_CAPTURE):
+            self.toggle_manual_lock()
         self._handle_thermal_hotkeys()
 
     # -------- главный цикл --------
@@ -1246,15 +1520,27 @@ class Overlay(QMainWindow):
         self.scanner.set_active(active)
 
         if active:
-            targets, main, motion = self.scanner.snapshot()
+            targets, main, motion, lock = self.scanner.snapshot()
+            # Сканер потерял шаблон (цель ушла/перекрыта дольше max_misses):
+            # снимаем хардлок и возвращаем слежение в состояние до захвата.
+            if self._manual_lock_owned and not self.scanner.has_manual_lock():
+                self._finish_manual_lock("lost")
+                lock = None
             shared_data["targets"] = targets
             shared_data["main_target"] = main
-            if shared_data["tracking_mode"] and main is not None:
-                self.execute_tracking(main)
+            shared_data["lock_target"] = lock
+            steer = lock if lock is not None else main
+            if shared_data["tracking_mode"] and steer is not None:
+                self.execute_tracking(steer)
         else:
+            # Срыв мог произойти в последнем скане перед отпусканием F —
+            # обрабатываем его и без активного сканирования.
+            if self._manual_lock_owned and not self.scanner.has_manual_lock():
+                self._finish_manual_lock("lost")
             targets, main, motion = [], None, None
             shared_data["targets"] = []
             shared_data["main_target"] = None
+            shared_data["lock_target"] = None
 
         self._update_radar_view(targets, motion, active)
 
@@ -1291,6 +1577,19 @@ class Overlay(QMainWindow):
                 )
 
         self._draw_radar_status(frame, active, len(targets), self._radar_zoom)
+        lock = shared_data.get("lock_target")
+        if lock is not None:
+            mx, my = win32api.GetCursorPos()
+            half = SQUARE_SIZE // 2
+            lx, ly, lw, lh = lock
+            x1, y1 = lx - (mx - half), ly - (my - half)
+            if x1 + lw > 0 and y1 + lh > 0 and x1 < SQUARE_SIZE and y1 < SQUARE_SIZE:
+                cv2.rectangle(frame, (x1, y1), (x1 + lw, y1 + lh), (255, 255, 0), 1)
+                label_y = y1 - 4 if y1 >= 14 else y1 + lh + 12
+                cv2.putText(
+                    frame, "LOCK", (max(2, x1), min(SQUARE_SIZE - 4, label_y)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1,
+                )
         if self._radar_zoom:
             # Увеличиваем уже готовый кадр целиком: карта, перекрестие и
             # подписи растут вместе с окном, пиксели остаются чёткими.
@@ -1349,6 +1648,13 @@ class Overlay(QMainWindow):
             f"{'ON' if zoomed else 'OFF'}",
             (10, 56), font, 0.4, zoom_color, 1,
         )
+        lock_color = (255, 255, 0) if shared_data.get("lock_target") else (128, 128, 128)
+        cv2.putText(
+            frame,
+            f"LOCK [{CV2_BIND_LABELS['capture']}]: "
+            f"{'ON' if shared_data.get('lock_target') else 'OFF'}",
+            (10, 74), font, 0.4, lock_color, 1,
+        )
 
         if not active:
             cv2.putText(
@@ -1358,12 +1664,13 @@ class Overlay(QMainWindow):
             cv2.putText(
                 frame,
                 f"[{CV2_BIND_LABELS['tracking']}] track  [{CV2_BIND_LABELS['thermal']}] thermal  "
-                f"[{CV2_BIND_LABELS['zoom']}] zoom  [{CV2_BIND_LABELS['hide']}] hide  [ESC] exit",
-                (10, h - 10), font, 0.37, (128, 128, 128), 1,
+                f"[{CV2_BIND_LABELS['zoom']}] zoom  [{CV2_BIND_LABELS['capture']}] lock  "
+                f"[{CV2_BIND_LABELS['hide']}] hide  [ESC] exit",
+                (10, h - 10), font, 0.33, (128, 128, 128), 1,
             )
             return
 
-        y = 76
+        y = 94
         track_color = (0, 255, 0) if shared_data["tracking_mode"] else (128, 128, 128)
         cv2.putText(
             frame, f"TRACKING [{CV2_BIND_LABELS['tracking']}]: "
@@ -1399,9 +1706,12 @@ class Overlay(QMainWindow):
             painter.drawEllipse(mx - half, my - half, SQUARE_SIZE, SQUARE_SIZE)
 
             center_x, center_y = shared_data["screen_center"]
+            locked = shared_data.get("lock_target") is not None
             for rect in shared_data["targets"]:
                 rx, ry, rw, rh = rect
-                is_main = rect == shared_data["main_target"]
+                # При ручном захвате радарные блобы вторичны: не подсвечиваем
+                # «главную» цель красным, чтобы трассер не выглядел захваченным.
+                is_main = (not locked) and rect == shared_data["main_target"]
                 color = QColor(255, 0, 0) if is_main else QColor(255, 140, 0)
                 painter.setPen(QPen(color, 2 if is_main else 1))
                 painter.drawRect(rx, ry, rw, rh)
@@ -1410,6 +1720,14 @@ class Overlay(QMainWindow):
                     QPen(QColor(color.red(), color.green(), color.blue(), 60), 3, Qt.DashLine)
                 )
                 painter.drawLine(center_x, center_y, rx + rw // 2, ry + rh // 2)
+
+            lock = shared_data.get("lock_target")
+            if lock is not None:
+                lx, ly, lw, lh = lock
+                painter.setPen(QPen(QColor(0, 255, 255), 2))
+                painter.drawRect(lx, ly, lw, lh)
+                painter.setFont(QFont("Consolas", 8, QFont.Bold))
+                painter.drawText(lx, max(12, ly - 4), "LOCK")
 
             painter.setPen(QPen(QColor(0, 220, 120, 170), 1))
             painter.setFont(QFont("Consolas", 8))

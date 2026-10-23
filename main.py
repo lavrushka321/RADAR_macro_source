@@ -27,7 +27,7 @@ from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PyQt5.QtWidgets import QApplication, QMainWindow
 
 
-__version__ = "beta-2.9 (local)"
+__version__ = "beta-2.10 (local)"
 
 RADAR_WINDOW_TITLE = "RADAR_VIEW"
 
@@ -117,6 +117,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "match_min": 0.45,
         "wide_match_min": 0.60,
         "max_misses": 8,
+        # После обычных промахов захват не сбрасывается сразу: ещё
+        # lost_timeout секунд шаблон ищется в радиусе lost_margin вокруг
+        # последней позиции (цель может выйти из кадра/уйти за укрытие).
+        "lost_margin": 220,
+        "lost_timeout": 2.0,
+        "lost_match_min": 0.70,
         "update_score": 0.85,
     },
     "THERMAL_SETTINGS": {
@@ -264,6 +270,17 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
     if lock["wide_match_min"] < lock["match_min"]:
         lock["wide_match_min"] = lock["match_min"]
     lock["max_misses"] = _as_int(lock.get("max_misses"), 8, 0, 60)
+    lock["lost_margin"] = _as_int(lock.get("lost_margin"), 220, 8, 800)
+    if lock["lost_margin"] < lock["wide_margin"]:
+        lock["lost_margin"] = lock["wide_margin"]
+    lock["lost_timeout"] = round(
+        _as_float(lock.get("lost_timeout"), 2.0, 0.0, 10.0), 2
+    )
+    lock["lost_match_min"] = round(
+        _as_float(lock.get("lost_match_min"), 0.70, 0.05, 0.99), 2
+    )
+    if lock["lost_match_min"] < lock["wide_match_min"]:
+        lock["lost_match_min"] = lock["wide_match_min"]
     lock["update_score"] = round(_as_float(lock.get("update_score"), 0.85, 0.5, 0.99), 2)
 
     _validate_profiles(cfg)
@@ -842,10 +859,12 @@ class ScanWorker(threading.Thread):
         # клиентской области окна. Живёт независимо от детектора движения.
         self._manual_template: Optional[np.ndarray] = None
         self._manual_center: Tuple[float, float] = (0.0, 0.0)
+        self._manual_last_seen: Optional[Tuple[float, float]] = None
         self._manual_velocity: Tuple[float, float] = (0.0, 0.0)
         self._manual_misses = 0
         self._manual_score = 0.0
         self._manual_rect: Optional[Rect] = None
+        self._manual_lost_at: Optional[float] = None
         self._manual_generation = 0
 
     def configure(
@@ -876,28 +895,41 @@ class ScanWorker(threading.Thread):
                 self._targets = []
                 self._main = None
                 self._motion = None
-                # Шаблон не теряем: после повторного F цель можно добрать
-                # широким поиском, но старую рамку и скорость сбрасываем.
-                self._manual_rect = None
+                # Шаблон и последнюю рамку не теряем: захват остаётся
+                # включённым, пока его не снимут T/Ё. Рамка просто замирает
+                # на последней позиции; после повторного F поиск продолжится.
                 self._manual_misses = 0
                 self._manual_velocity = (0.0, 0.0)
+                self._manual_lost_at = None
+                # Отменяем незавершённый скан, чтобы он не перезаписал
+                # замороженную рамку уже после отпускания F.
+                self._manual_generation += 1
 
-    def set_manual_lock(self, template: np.ndarray, center: Tuple[int, int]) -> None:
+    def set_manual_lock(
+        self,
+        template: np.ndarray,
+        center: Tuple[float, float],
+        rect: Optional[Rect] = None,
+    ) -> None:
         """Захватить цель по шаблону из точки под курсором."""
         with self._lock:
             self._manual_template = template.copy()
             self._manual_center = (float(center[0]), float(center[1]))
+            self._manual_last_seen = (float(center[0]), float(center[1]))
             self._manual_velocity = (0.0, 0.0)
             self._manual_misses = 0
             self._manual_score = 1.0
-            self._manual_rect = None
+            self._manual_rect = rect
+            self._manual_lost_at = None
             self._manual_generation += 1
 
     def clear_manual_lock(self) -> None:
         with self._lock:
             self._manual_template = None
             self._manual_rect = None
+            self._manual_last_seen = None
             self._manual_score = 0.0
+            self._manual_lost_at = None
             self._manual_generation += 1
 
     def has_manual_lock(self) -> bool:
@@ -909,6 +941,11 @@ class ScanWorker(threading.Thread):
     ) -> Tuple[List[Rect], Optional[Rect], Optional[np.ndarray], Optional[Rect]]:
         with self._lock:
             return self._targets, self._main, self._motion, self._manual_rect
+
+    def manual_lock_rect(self) -> Optional[Rect]:
+        """Последняя рамка захвата; сохраняется и при выключенном поиске."""
+        with self._lock:
+            return self._manual_rect
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -1043,20 +1080,23 @@ class ScanWorker(threading.Thread):
         return matched, float(max_val)
 
     def _update_manual_lock(self, gray: np.ndarray, origin: Tuple[int, int]) -> None:
-        """Ведёт цель по шаблону, переживая короткие перекрытия (трассеры).
+        """Ведёт цель по шаблону и не сдаётся сразу после промахов.
 
-        Локальный поиск идёт только рядом с предсказанной позицией, поэтому
-        посторонний яркий блоб не может «украсть» захват. Если шаблон пропал,
-        несколько сканов курсор ведётся по последней скорости (coast), затем
-        делается более широкий поиск с повышенным порогом.
+        Сначала поиск идёт рядом с предсказанной позицией (coast), затем шире.
+        Когда обычный лимит промахов исчерпан, ещё lost_timeout секунд шаблон
+        ищется в радиусе lost_margin вокруг последней подтверждённой позиции —
+        так захват переживает уход цели за укрытие или резкий рывок.
         """
+        now = time.perf_counter()
         with self._lock:
             template = self._manual_template
             if template is None:
                 return
             center = self._manual_center
+            last_seen = self._manual_last_seen or center
             velocity = self._manual_velocity
             misses = self._manual_misses
+            lost_at = self._manual_lost_at
             generation = self._manual_generation
 
         th, tw = template.shape[:2]
@@ -1066,16 +1106,21 @@ class ScanWorker(threading.Thread):
                 if generation == self._manual_generation:
                     self._manual_template = None
                     self._manual_rect = None
+                    self._manual_last_seen = None
+                    self._manual_lost_at = None
             return
 
         predicted = (center[0] + velocity[0], center[1] + velocity[1])
         settings = LOCK_SETTINGS
+        max_misses = int(settings["max_misses"])
         match = self._match_template(
             gray, template, predicted, int(settings["search_margin"])
         )
         accepted = match is not None and match[1] >= float(settings["match_min"])
+        lost_mode = not accepted and misses + 1 > max_misses
+        matched_via_lost = False
 
-        if not accepted and misses % 2 == 0:
+        if not accepted and not lost_mode and misses % 2 == 0:
             # Широкий поиск не каждый скан: он дороже, а нужен только когда
             # цель резко сместилась или её кратко перекрыли.
             wide = self._match_template(
@@ -1088,30 +1133,84 @@ class ScanWorker(threading.Thread):
             ):
                 match = wide
                 accepted = True
+                lost_mode = False
+
+        if not accepted and lost_mode:
+            # Обычный лимит промахов исчерпан: продолжаем искать в большем
+            # радиусе вокруг последней подтверждённой позиции. Более высокий
+            # порог lost_match_min защищает от ложного захвата фона.
+            if lost_at is None:
+                lost_at = now
+            lost = self._match_template(
+                gray, template, last_seen, int(settings["lost_margin"])
+            )
+            if lost is not None and lost[1] >= float(settings["lost_match_min"]):
+                match = lost
+                accepted = True
+                matched_via_lost = True
 
         if accepted and match is not None:
             new_center, score = match
-            velocity = (
-                0.5 * velocity[0] + 0.5 * (new_center[0] - center[0]),
-                0.5 * velocity[1] + 0.5 * (new_center[1] - center[1]),
-            )
+            dx = new_center[0] - center[0]
+            dy = new_center[1] - center[1]
+            jump = (dx * dx + dy * dy) ** 0.5
+            if matched_via_lost or jump > float(settings["wide_margin"]):
+                # Резкий прыжок — это скорее перезахват, чем обычное движение:
+                # не разгоняем рамку по инерции в сторону от цели.
+                velocity = (0.0, 0.0)
+            else:
+                vx = 0.5 * velocity[0] + 0.5 * dx
+                vy = 0.5 * velocity[1] + 0.5 * dy
+                limit = 60.0
+                velocity = (
+                    max(-limit, min(limit, vx)),
+                    max(-limit, min(limit, vy)),
+                )
             misses = 0
+            lost_at = None
+            last_seen = new_center
             # Обновляем шаблон только при уверенном совпадении, чтобы трассер
-            # или вспышка не «впечатались» в эталон.
-            if score >= float(settings["update_score"]):
+            # или вспышка не «впечатались» в эталон. Для lost-поиска порог
+            # обновления ещё выше: слабое совпадение не должно уводить эталон.
+            if score >= float(settings["update_score"]) and (
+                not matched_via_lost or score >= 0.90
+            ):
                 patch = self._patch_at(gray, new_center, tw, th)
                 if patch is not None:
                     template = cv2.addWeighted(template, 0.8, patch, 0.2, 0)
         else:
             misses += 1
-            new_center = predicted
+            if lost_mode:
+                # В режиме поиска рамка стоит на последней подтверждённой
+                # позиции, а не уезжает по инерции: ищем «от себя».
+                new_center = last_seen
+                velocity = (0.0, 0.0)
+            else:
+                new_center = predicted
+                velocity = (velocity[0] * 0.9, velocity[1] * 0.9)
+                # Не уводим рамку далеко от последней подтверждённой точки:
+                # потерянную цель всё равно ищем в lost_margin от неё.
+                cap = float(settings["wide_margin"])
+                dx = new_center[0] - last_seen[0]
+                dy = new_center[1] - last_seen[1]
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist > cap and dist > 0.0:
+                    new_center = (
+                        last_seen[0] + dx * cap / dist,
+                        last_seen[1] + dy * cap / dist,
+                    )
             score = match[1] if match is not None else 0.0
-            velocity = (velocity[0] * 0.9, velocity[1] * 0.9)
 
-        if misses > int(settings["max_misses"]):
+        lost_expired = (
+            lost_at is not None
+            and now - lost_at > float(settings["lost_timeout"])
+        )
+        if misses > max_misses and lost_expired:
             template = None
             rect: Optional[Rect] = None
             score = 0.0
+            last_seen = None
+            lost_at = None
         else:
             left = max(0, min(frame_w - tw, int(round(new_center[0] - tw / 2.0))))
             top = max(0, min(frame_h - th, int(round(new_center[1] - th / 2.0))))
@@ -1123,10 +1222,12 @@ class ScanWorker(threading.Thread):
                 return
             self._manual_template = template
             self._manual_center = new_center
+            self._manual_last_seen = last_seen
             self._manual_velocity = velocity
             self._manual_misses = misses
             self._manual_score = score
             self._manual_rect = rect
+            self._manual_lost_at = lost_at
 
 # ==================== ТЕПЛОВИЗОР (ПОТОК) ====================
 
@@ -1252,6 +1353,7 @@ class Overlay(QMainWindow):
         # Ручной захват (хардлок): помним, было ли слежение V включено до него.
         # Если захват сам включил V, после снятия/срыва вернём его в OFF.
         self._lock_tracking_before = False
+        self._lock_tracking_auto = False
         self._manual_lock_owned = False
 
         self.scanner = ScanWorker()
@@ -1399,21 +1501,32 @@ class Overlay(QMainWindow):
             print("[lock] область слишком однородная — наведите на цель")
             return
 
+        # Координаты рамки на экране — сразу, чтобы LOCK был виден даже без
+        # активного поиска (когда сканер ещё не сделал ни одного кадра).
+        screen_rect = (origin[0] + left, origin[1] + top, size, size)
+
         # Запоминаем состояние V до захвата: если слежение было выключено,
         # после снятия или срыва захвата вернём его в OFF.
         self._lock_tracking_before = bool(shared_data["tracking_mode"])
+        self._lock_tracking_auto = False
         self._manual_lock_owned = True
-        self.scanner.set_manual_lock(patch, (left + size / 2.0, top + size / 2.0))
-        # При ручном захвате сразу включаем слежение: цель может быть не
-        # найдена радаром, но вестись по шаблону она всё равно будет.
-        shared_data["tracking_mode"] = True
+        self.scanner.set_manual_lock(
+            patch, (left + size / 2.0, top + size / 2.0), screen_rect
+        )
+        shared_data["lock_target"] = screen_rect
+        # Слежение включаем только при активном поиске. Без поиска захват
+        # остаётся включённым, но курсор за целью не ведётся.
+        if keys.pressed(VK_SCAN) and not self._lock_tracking_before:
+            shared_data["tracking_mode"] = True
+            self._lock_tracking_auto = True
+        self.update()
         print(f"[lock] target captured ({size}x{size})")
 
     def _finish_manual_lock(self, reason: str) -> None:
-        """Снимает захват и восстанавливает слежение, если оно было выключено."""
-        restore_off = not self._lock_tracking_before
+        """Снимает захват; выключает V, только если захват сам его включил."""
+        auto_enabled = self._lock_tracking_auto
         self.clear_manual_lock()
-        if restore_off:
+        if auto_enabled:
             shared_data["tracking_mode"] = False
         print(f"[lock] {reason}")
 
@@ -1421,7 +1534,9 @@ class Overlay(QMainWindow):
         self.scanner.clear_manual_lock()
         shared_data["lock_target"] = None
         self._lock_tracking_before = False
+        self._lock_tracking_auto = False
         self._manual_lock_owned = False
+        self.update()
 
     # -------- thermal --------
 
@@ -1540,7 +1655,11 @@ class Overlay(QMainWindow):
             targets, main, motion = [], None, None
             shared_data["targets"] = []
             shared_data["main_target"] = None
-            shared_data["lock_target"] = None
+            # Захват при отпущенном F не снимается: рамка замирает на
+            # последней позиции и снова начнёт обновляться при нажатии F.
+            shared_data["lock_target"] = (
+                self.scanner.manual_lock_rect() if self._manual_lock_owned else None
+            )
 
         self._update_radar_view(targets, motion, active)
 
@@ -1693,45 +1812,52 @@ class Overlay(QMainWindow):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         try:
-            if self.is_hidden or not shared_data["active"]:
-                # Прозрачный слой чистим явно: если просто выйти из paintEvent,
-                # последний кадр с боксами остаётся на экране.
-                painter.setCompositionMode(QPainter.CompositionMode_Source)
-                painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
+            # Прозрачный слой чистим явно каждый раз: при отпускании F не
+            # должны оставаться круг и старые боксы, но LOCK остаётся видимым.
+            painter.setCompositionMode(QPainter.CompositionMode_Source)
+            painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
+            if self.is_hidden:
                 return
 
+            active = bool(shared_data["active"])
+            lock = shared_data.get("lock_target")
+            if not active and lock is None:
+                return
+
+            painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
             mx, my = win32api.GetCursorPos()
             half = SQUARE_SIZE // 2
-            painter.setPen(QPen(QColor(0, 255, 0, 80), 1))
-            painter.drawEllipse(mx - half, my - half, SQUARE_SIZE, SQUARE_SIZE)
 
-            center_x, center_y = shared_data["screen_center"]
-            locked = shared_data.get("lock_target") is not None
-            for rect in shared_data["targets"]:
-                rx, ry, rw, rh = rect
-                # При ручном захвате радарные блобы вторичны: не подсвечиваем
-                # «главную» цель красным, чтобы трассер не выглядел захваченным.
-                is_main = (not locked) and rect == shared_data["main_target"]
-                color = QColor(255, 0, 0) if is_main else QColor(255, 140, 0)
-                painter.setPen(QPen(color, 2 if is_main else 1))
-                painter.drawRect(rx, ry, rw, rh)
+            if active:
+                painter.setPen(QPen(QColor(0, 255, 0, 80), 1))
+                painter.drawEllipse(mx - half, my - half, SQUARE_SIZE, SQUARE_SIZE)
 
-                painter.setPen(
-                    QPen(QColor(color.red(), color.green(), color.blue(), 60), 3, Qt.DashLine)
-                )
-                painter.drawLine(center_x, center_y, rx + rw // 2, ry + rh // 2)
+                center_x, center_y = shared_data["screen_center"]
+                locked = lock is not None
+                for rect in shared_data["targets"]:
+                    rx, ry, rw, rh = rect
+                    # При ручном захвате радарные блобы вторичны: не подсвечиваем
+                    # «главную» цель красным, чтобы трассер не выглядел захваченным.
+                    is_main = (not locked) and rect == shared_data["main_target"]
+                    color = QColor(255, 0, 0) if is_main else QColor(255, 140, 0)
+                    painter.setPen(QPen(color, 2 if is_main else 1))
+                    painter.drawRect(rx, ry, rw, rh)
 
-            lock = shared_data.get("lock_target")
+                    painter.setPen(
+                        QPen(QColor(color.red(), color.green(), color.blue(), 60), 3, Qt.DashLine)
+                    )
+                    painter.drawLine(center_x, center_y, rx + rw // 2, ry + rh // 2)
+
+                painter.setPen(QPen(QColor(0, 220, 120, 170), 1))
+                painter.setFont(QFont("Consolas", 8))
+                painter.drawText(mx + half + 6, my - half + 12, get_profile()["title"])
+
             if lock is not None:
                 lx, ly, lw, lh = lock
                 painter.setPen(QPen(QColor(0, 255, 255), 2))
                 painter.drawRect(lx, ly, lw, lh)
                 painter.setFont(QFont("Consolas", 8, QFont.Bold))
                 painter.drawText(lx, max(12, ly - 4), "LOCK")
-
-            painter.setPen(QPen(QColor(0, 220, 120, 170), 1))
-            painter.setFont(QFont("Consolas", 8))
-            painter.drawText(mx + half + 6, my - half + 12, get_profile()["title"])
         finally:
             painter.end()
 

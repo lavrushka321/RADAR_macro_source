@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -27,7 +27,7 @@ from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PyQt5.QtWidgets import QApplication, QMainWindow
 
 
-__version__ = "beta-2.11 (local)"
+__version__ = "beta-3.1 (local)"
 
 RADAR_WINDOW_TITLE = "RADAR_VIEW"
 
@@ -132,9 +132,17 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "bg_alpha": 140,
         "max_dots": 20000,
     },
+    # window  — тепловая карта в мини-окне RADAR_VIEW;
+    # overlay — полупрозрачный слой на весь экран.
+    "THERMAL_MODE": "window",
     "BINDS": {
         "key_scan": "F",
         "key_thermal": "Q",
+        # Полноэкранный поиск целей по активному профилю. Работает отдельно
+        # от тепловизора: Q показывает тепловую карту, H ищет цели.
+        "key_fullscan": "H",
+        # Переключение места показа тепловизора: окно RADAR_VIEW / оверлей.
+        "key_thermal_mode": "Y",
         "key_tracking": "V",
         "key_profile": "G",
         "key_zoom": "Z",
@@ -298,6 +306,11 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
     thermal["bg_alpha"] = _as_int(thermal.get("bg_alpha"), 140, 0, 255)
     thermal["max_dots"] = _as_int(thermal.get("max_dots"), 20000, 1000, 50000)
 
+    thermal_mode_value = str(cfg.get("THERMAL_MODE", "window")).strip().lower()
+    if thermal_mode_value not in ("window", "overlay"):
+        thermal_mode_value = "window"
+    cfg["THERMAL_MODE"] = thermal_mode_value
+
     windows = cfg.get("THERMAL_WINDOWS")
     if not isinstance(windows, list) or not windows:
         cfg["THERMAL_WINDOWS"] = copy.deepcopy(DEFAULT_SETTINGS["THERMAL_WINDOWS"])
@@ -457,6 +470,12 @@ def get_profile(name: Optional[str] = None) -> Dict[str, Any]:
     return profiles[key]
 
 
+def thermal_mode() -> str:
+    """Текущее место показа тепловизора: window или overlay."""
+    mode = str(config.get("THERMAL_MODE", "window")).strip().lower()
+    return mode if mode in ("window", "overlay") else "window"
+
+
 _binds_cfg: Dict[str, Any] = config["BINDS"]
 
 
@@ -472,6 +491,8 @@ def _bind(name: str, default: str) -> int:
 
 VK_SCAN = _bind("key_scan", "F")
 VK_THERMAL = _bind("key_thermal", "Q")
+VK_FULLSCAN = _bind("key_fullscan", "H")
+VK_THERMAL_MODE = _bind("key_thermal_mode", "Y")
 VK_TRACK = _bind("key_tracking", "V")
 VK_PROFILE = _bind("key_profile", "G")
 VK_ZOOM = _bind("key_zoom", "Z")
@@ -482,13 +503,14 @@ VK_HIDE = _bind("key_hide", "Ё")
 BIND_LABELS: Dict[str, str] = {
     name: str(_binds_cfg.get(f"key_{name}", default)).upper()
     for name, default in (
-        ("scan", "F"), ("thermal", "Q"), ("tracking", "V"),
-        ("profile", "G"), ("zoom", "Z"), ("capture", "T"),
-        ("exit", "ESCAPE"), ("hide", "Ё"),
+        ("scan", "F"), ("thermal", "Q"), ("fullscan", "H"),
+        ("thermal_mode", "Y"), ("tracking", "V"), ("profile", "G"),
+        ("zoom", "Z"), ("capture", "T"), ("exit", "ESCAPE"),
+        ("hide", "Ё"),
     )
 }
 
-# cv2.putText не умеет кириллицу — для окна RADAR_VIEW и thermal-оверлея
+# cv2.putText не умеет кириллицу — для окна RADAR_VIEW и полного вида
 # держим ASCII-вариант подписей. Ё — рабочая клавиша скрытия, поэтому
 # показываем её транслитерацией, а не вопросительным знаком.
 def _cv2_label(label: str) -> str:
@@ -536,6 +558,9 @@ shared_data: Dict[str, Any] = {
     "main_target": None,
     "lock_target": None,
     "thermal_active": False,
+    "fullscan_active": False,
+    "full_targets": [],
+    "full_main": None,
 }
 
 # ==================== ЗАХВАТ ОКНА ====================
@@ -1256,99 +1281,280 @@ class ScanWorker(threading.Thread):
 
 # ==================== ТЕПЛОВИЗОР (ПОТОК) ====================
 
+class FullViewSnapshot(NamedTuple):
+    """Один кадр полного окна Roblox для RADAR_VIEW.
+
+    ``thermal`` — цветная тепловая карта (BGR) для RADAR_VIEW, ``overlay`` —
+    прозрачный BGRA-слой для полноэкранного оверлея, ``motion`` — сырая карта
+    разницы кадров (grayscale). ``targets`` уже в экранных координатах,
+    ``origin``/``size`` нужны для пересчёта рамок в координаты окна.
+    """
+
+    thermal: Optional[np.ndarray]
+    overlay: Optional[np.ndarray]
+    motion: Optional[np.ndarray]
+    targets: List[Rect]
+    main: Optional[Rect]
+    origin: Tuple[int, int]
+    size: Tuple[int, int]
+    found: bool
+    count: int
+
+
 class ThermalWorker(threading.Thread):
-    """Захват окна и построение RGBA-слоя точек вне UI-потока."""
+    """Полное окно Roblox: тепловая карта, оверлей и полный поиск целей.
+
+    В режиме ``window`` воркер отдаёт BGR-карту для RADAR_VIEW, в режиме
+    ``overlay`` — прозрачный BGRA-слой для полноэкранного оверлея. Один захват
+    кадра используется и для отображения, и для поиска целей, поэтому Q и H
+    можно включать независимо друг от друга без второго прохода PrintWindow.
+    """
 
     def __init__(self) -> None:
-        super().__init__(daemon=True, name="radar-thermal")
+        super().__init__(daemon=True, name="radar-fullview")
         self._stop_evt = threading.Event()
         self._active_evt = threading.Event()
-        self._lock = threading.Lock()
-        self._rgba: Optional[np.ndarray] = None
-        self._origin: Tuple[int, int] = (0, 0)
-        self._found = False
-        self._count = 0
+        self._lock = threading.RLock()
+        self._snapshot = self._empty()
+        self._thermal_active = False
+        self._fullscan_active = False
         self._prev: Optional[np.ndarray] = None
+        self._profile: Dict[str, Any] = dict(get_profile())
+        self._tracker = TargetTracker()
+        self._targets: List[Rect] = []
+        self._main: Optional[Rect] = None
+
+    @staticmethod
+    def _empty(
+        found: bool = False,
+        origin: Tuple[int, int] = (0, 0),
+        size: Tuple[int, int] = (0, 0),
+    ) -> FullViewSnapshot:
+        return FullViewSnapshot(
+            None, None, None, [], None, origin, size, found, 0
+        )
+
+    def configure(self, profile: Dict[str, Any]) -> None:
+        """Смена профиля поиска: старые подтверждения больше не актуальны."""
+        with self._lock:
+            self._profile = dict(profile)
+            self._tracker = TargetTracker()
+            self._targets = []
+            self._main = None
+
+    def set_thermal(self, active: bool) -> None:
+        with self._lock:
+            self._thermal_active = bool(active)
+            if not active:
+                # Не показываем старую тепловую карту, пока воркер не сделает
+                # следующий кадр уже без Q.
+                self._snapshot = self._snapshot._replace(
+                    thermal=None, overlay=None
+                )
+        self._refresh_active()
+
+    def set_fullscan(self, active: bool) -> None:
+        with self._lock:
+            self._fullscan_active = bool(active)
+            if not active:
+                self._targets = []
+                self._main = None
+                self._tracker = TargetTracker()
+                # Рамки полного поиска должны исчезнуть сразу, не дожидаясь
+                # следующего кадра; тепловая карта при включённом Q остаётся.
+                self._snapshot = self._snapshot._replace(
+                    targets=[], main=None, motion=None
+                )
+        self._refresh_active()
 
     def set_active(self, active: bool) -> None:
+        """Совместимость со старым API: включает только тепловую карту."""
+        self.set_thermal(active)
+
+    def _refresh_active(self) -> None:
+        with self._lock:
+            active = self._thermal_active or self._fullscan_active
         if active:
             self._active_evt.set()
             return
+
         self._active_evt.clear()
         self._prev = None
         with self._lock:
-            self._rgba = None
-            self._origin = (0, 0)
-            self._found = False
-            self._count = 0
+            self._snapshot = self._empty()
+            self._targets = []
+            self._main = None
+            self._tracker = TargetTracker()
 
-    def snapshot(self) -> Tuple[Optional[np.ndarray], Tuple[int, int], bool, int]:
+    def snapshot(self) -> FullViewSnapshot:
         with self._lock:
-            return self._rgba, self._origin, self._found, self._count
+            snap = self._snapshot
+            # Списки отдаём копией: UI читает их из другого потока.
+            return snap._replace(targets=list(snap.targets))
 
     def stop(self) -> None:
         self._stop_evt.set()
         self._active_evt.set()
-        self.join(1.0)
+        self.join(1.5)
 
     def run(self) -> None:
         while not self._stop_evt.is_set():
             if not self._active_evt.wait(0.1):
                 continue
-            try:
-                rgba, origin, found, count = self._scan_once()
-            except Exception as exc:
-                print(f"[thermal] {exc}")
-                rgba, origin, found, count = None, (0, 0), False, 0
-                time.sleep(0.1)
-            with self._lock:
-                self._rgba = rgba
-                self._origin = origin
-                self._found = found
-                self._count = count
-            time.sleep(0.05)
 
-    def _scan_once(self) -> Tuple[Optional[np.ndarray], Tuple[int, int], bool, int]:
+            started = time.perf_counter()
+            try:
+                snap = self._scan_once()
+            except Exception as exc:
+                print(f"[fullview] {exc}")
+                snap = self._empty()
+                self._prev = None
+            with self._lock:
+                # Режим могли выключить, пока шёл захват/детект. Не отдаём
+                # в UI уже отключённые слои даже на один кадр.
+                if not self._fullscan_active:
+                    snap = snap._replace(targets=[], main=None, motion=None)
+                if not self._thermal_active:
+                    snap = snap._replace(thermal=None, overlay=None)
+                elif thermal_mode() == "window":
+                    snap = snap._replace(overlay=None)
+                else:
+                    snap = snap._replace(thermal=None)
+                self._snapshot = snap
+
+            delay = 0.05 - (time.perf_counter() - started)
+            if delay > 0:
+                self._stop_evt.wait(delay)
+
+    def _scan_once(self) -> FullViewSnapshot:
+        with self._lock:
+            thermal_on = self._thermal_active
+            fullscan_on = self._fullscan_active
+            profile = dict(self._profile)
+        mode = thermal_mode()
+        want_window = thermal_on and mode == "window"
+        want_overlay = thermal_on and mode == "overlay"
+
         captured = capture_roblox_window()
         if captured is None:
             self._prev = None
-            return None, (0, 0), False, 0
+            return self._empty()
 
         gray, origin = captured
+        height, width = gray.shape
         prev = self._prev
         self._prev = gray
+
         if prev is None or prev.shape != gray.shape:
-            return None, origin, True, 0
+            thermal = self._thermal_bg(width, height) if want_window else None
+            overlay = (
+                np.zeros((height, width, 4), dtype=np.uint8)
+                if want_overlay
+                else None
+            )
+            return FullViewSnapshot(
+                thermal, overlay, None, [], None, origin, (width, height), True, 0
+            )
 
         diff = cv2.absdiff(prev, gray)
-        _, mask = cv2.threshold(diff, int(THERMAL_SETTINGS["threshold"]), 255, cv2.THRESH_BINARY)
+        thermal: Optional[np.ndarray] = None
+        overlay: Optional[np.ndarray] = None
+        count = 0
+        if thermal_on:
+            thermal, overlay, count = self._thermal_image(
+                diff, want_window, want_overlay
+            )
+
+        targets: List[Rect] = []
+        main: Optional[Rect] = None
+        if fullscan_on:
+            raw = analyze_motion(diff, profile)
+            screen_rects = [
+                (origin[0] + x, origin[1] + y, tw, th)
+                for x, y, tw, th in raw
+            ]
+            with self._lock:
+                targets = self._tracker.update(screen_rects, profile)
+                self._targets = list(targets)
+                main = (
+                    max(targets, key=lambda rect: rect[2] * rect[3])
+                    if targets
+                    else None
+                )
+                self._main = main
+        else:
+            with self._lock:
+                self._targets = []
+                self._main = None
+
+        # Сырая карта нужна, когда H включён без тепловизора. Если включён
+        # только Q, показываем тепловую карту и не тратим память на копию.
+        motion = diff if fullscan_on else None
+        return FullViewSnapshot(
+            thermal, overlay, motion, list(targets), main, origin,
+            (width, height), True, count,
+        )
+
+    @staticmethod
+    def _thermal_bg(width: int, height: int) -> np.ndarray:
+        """Тёмный фон тепловой карты (цвет BGR)."""
+        # В режиме window bg_alpha задаёт яркость фона RADAR_VIEW, в режиме
+        # overlay — прозрачность затемнения всего экрана.
+        bg = max(0, min(80, int(THERMAL_SETTINGS.get("bg_alpha", 140)) // 4))
+        return np.full((height, width, 3), bg, dtype=np.uint8)
+
+    @staticmethod
+    def _thermal_image(
+        diff: np.ndarray, want_window: bool, want_overlay: bool
+    ) -> Tuple[
+        Optional[np.ndarray], Optional[np.ndarray], int
+    ]:
+        """Цветная тепловая карта всего окна по разнице кадров.
+
+        ``want_window`` — BGR-карта для RADAR_VIEW, ``want_overlay`` — BGRA-слой
+        для полупрозрачного полноэкранного оверлея (фон прозрачный).
+        Порог, шаг выборки и размер точки берутся из THERMAL_SETTINGS.
+        """
+        height, width = diff.shape
+        _, mask = cv2.threshold(
+            diff, int(THERMAL_SETTINGS["threshold"]), 255, cv2.THRESH_BINARY
+        )
 
         step = max(1, int(THERMAL_SETTINGS["sample_step"]))
-        sub = mask[::step, ::step]
-        ys, xs = np.where(sub == 255)
-        if xs.size == 0:
-            return None, origin, True, 0
+        if step > 1:
+            sampled = np.zeros_like(mask)
+            sampled[::step, ::step] = mask[::step, ::step]
+            mask = sampled
 
-        xs = xs * step
-        ys = ys * step
-        max_dots = max(1, int(THERMAL_SETTINGS["max_dots"]))
-        if xs.size > max_dots:
-            indices = np.random.choice(xs.size, max_dots, replace=False)
-            xs, ys = xs[indices], ys[indices]
-        count = int(xs.size)
-
-        # Точки сразу запекаются в RGBA-буфер: QPainter рисует его одним
-        # drawImage вместо тысяч fillRect с новым QColor на каждую точку.
-        dots = np.zeros(mask.shape, dtype=np.uint8)
-        dots[ys, xs] = 255
         dot_size = max(1, int(THERMAL_SETTINGS["dot_size"]))
         if dot_size > 1:
-            dots = cv2.dilate(dots, np.ones((dot_size, dot_size), dtype=np.uint8))
+            mask = cv2.dilate(
+                mask, np.ones((dot_size, dot_size), dtype=np.uint8)
+            )
 
-        rgba = np.empty((dots.shape[0], dots.shape[1], 4), dtype=np.uint8)
-        rgba[..., :3] = dots[..., None]
-        rgba[..., 3] = dots
-        return rgba, origin, True, count
+        count = int(cv2.countNonZero(mask))
+        heat: Optional[np.ndarray] = None
+        if count:
+            hot = cv2.bitwise_and(diff, diff, mask=mask)
+            gain = max(1, int(config.get("MOTION_MAP_GAIN", 8)))
+            hot = cv2.convertScaleAbs(hot, alpha=gain)
+            heat = cv2.applyColorMap(hot, cv2.COLORMAP_INFERNO)
+
+        thermal: Optional[np.ndarray] = None
+        if want_window:
+            thermal = ThermalWorker._thermal_bg(width, height)
+            if heat is not None:
+                thermal[mask != 0] = heat[mask != 0]
+
+        overlay: Optional[np.ndarray] = None
+        if want_overlay:
+            # BGRA: QImage.Format_ARGB32 на Windows читает байты B,G,R,A.
+            overlay = np.zeros((height, width, 4), dtype=np.uint8)
+            if heat is not None:
+                overlay[mask != 0, :3] = heat[mask != 0]
+                overlay[mask != 0, 3] = 255
+
+        return thermal, overlay, count
 
 # ==================== ОВЕРЛЕЙ РАДАРА ====================
 
@@ -1367,13 +1573,20 @@ class Overlay(QMainWindow):
         self.is_hidden = False
         self._closing = False
         self._prev_active = False
+        self._prev_fullscan = False
         self._next_paint = 0.0
         self._next_view = 0.0
         self._next_topmost = 0.0
         self._radar_hwnd: Optional[int] = None
+        self._radar_window_created = False
         self._radar_zoom = False
         self._track_next = 0.0
-        self._thermal_overlay: Optional[ThermalOverlay] = None
+
+        # Кэш BGRA-слоя тепловизора для полноэкранного оверлея: QImage
+        # ссылается на numpy-буфер, поэтому храним и сам массив.
+        self._thermal_qimage: Optional[QImage] = None
+        self._thermal_qimage_key: Optional[Tuple[int, Tuple[int, ...]]] = None
+        self._thermal_qimage_data: Optional[np.ndarray] = None
 
         # Ручной захват (хардлок): помним, было ли слежение V включено до него.
         # Если захват сам включил V, после снятия/срыва вернём его в OFF.
@@ -1386,10 +1599,12 @@ class Overlay(QMainWindow):
         self.scanner.start()
 
         self.thermal_worker = ThermalWorker()
+        self.thermal_worker.configure(profile=get_profile())
         self.thermal_worker.start()
 
         if config.get("SHOW_RADAR_VIEW", True):
-            cv2.namedWindow(RADAR_WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
+            self._ensure_radar_view()
+            self._apply_radar_window_size()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.logic_tick)
@@ -1397,24 +1612,72 @@ class Overlay(QMainWindow):
 
     # -------- видимость --------
 
+    def _radar_view_wanted(self) -> bool:
+        """Окно нужно, если оно включено в конфиге или активен полный вид.
+
+        Тепловизор в режиме overlay рисуется поверх экрана и сам по себе
+        мини-окно не требует.
+        """
+        thermal_window = (
+            shared_data.get("thermal_active") and thermal_mode() == "window"
+        )
+        return bool(
+            config.get("SHOW_RADAR_VIEW", True)
+            or shared_data.get("fullscan_active")
+            or thermal_window
+        )
+
+    def _ensure_radar_view(self) -> bool:
+        """Создаёт RADAR_VIEW по требованию (Q/H работают и при SHOW=false)."""
+        if self.is_hidden or not self._radar_view_wanted():
+            return False
+        if self._radar_window_created:
+            return True
+        try:
+            cv2.namedWindow(RADAR_WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
+            self._radar_window_created = True
+            self._radar_hwnd = None
+            self._next_topmost = 0.0
+            return True
+        except Exception as exc:
+            print(f"[view] create: {exc}")
+            self._radar_window_created = False
+            return False
+
+    def _maybe_close_radar_view(self) -> None:
+        """Закрывает окно, если оно больше не нужно для Q/H."""
+        if self._radar_view_wanted():
+            return
+        if not self._radar_window_created:
+            return
+        try:
+            cv2.destroyWindow(RADAR_WINDOW_TITLE)
+        except Exception:
+            pass
+        self._radar_window_created = False
+        self._radar_hwnd = None
+
     def toggle_hide(self) -> None:
         if not self.is_hidden:
             self.is_hidden = True
             shared_data["active"] = False
             shared_data["tracking_mode"] = False
             shared_data["thermal_active"] = False
+            shared_data["fullscan_active"] = False
             shared_data["targets"] = []
             shared_data["main_target"] = None
+            shared_data["full_targets"] = []
+            shared_data["full_main"] = None
             self.clear_manual_lock()
             self.scanner.set_active(False)
-            self.thermal_worker.set_active(False)
-            if self._thermal_overlay is not None:
-                self._thermal_overlay.hide()
-            if config.get("SHOW_RADAR_VIEW", True):
+            self.thermal_worker.set_thermal(False)
+            self.thermal_worker.set_fullscan(False)
+            if self._radar_window_created:
                 try:
                     cv2.destroyWindow(RADAR_WINDOW_TITLE)
                 except Exception:
                     pass
+                self._radar_window_created = False
                 self._radar_hwnd = None
             self.hide()
         else:
@@ -1423,15 +1686,11 @@ class Overlay(QMainWindow):
             self._restore_radar_window()
 
     def _restore_radar_window(self) -> None:
-        if not config.get("SHOW_RADAR_VIEW", True):
+        if not self._radar_view_wanted():
             return
-        try:
-            cv2.namedWindow(RADAR_WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
-            self._radar_hwnd = None
-            self._next_topmost = 0.0
-            self._apply_radar_window_size()
-        except Exception as exc:
-            print(f"[view] restore: {exc}")
+        if not self._ensure_radar_view():
+            return
+        self._apply_radar_window_size()
 
     def toggle_radar_zoom(self) -> None:
         """Включает/выключает увеличение окна RADAR_VIEW в 2 раза."""
@@ -1442,7 +1701,9 @@ class Overlay(QMainWindow):
 
     def _apply_radar_window_size(self) -> None:
         """Подгоняет окно RADAR_VIEW под текущий масштаб и держит его на экране."""
-        if self.is_hidden or not config.get("SHOW_RADAR_VIEW", True):
+        if self.is_hidden or not self._radar_view_wanted():
+            return
+        if not self._ensure_radar_view():
             return
         size = SQUARE_SIZE * (2 if self._radar_zoom else 1)
         try:
@@ -1495,6 +1756,7 @@ class Overlay(QMainWindow):
         active_profile = names[index]
         config["ACTIVE_PROFILE"] = active_profile
         self.scanner.configure(profile=get_profile())
+        self.thermal_worker.configure(profile=get_profile())
         save_config()
         print(f"[profile] {get_profile()['title']}")
 
@@ -1563,25 +1825,61 @@ class Overlay(QMainWindow):
         self._manual_lock_owned = False
         self.update()
 
-    # -------- thermal --------
+    # -------- тепловизор и полный поиск --------
 
     def toggle_thermal(self) -> None:
         if not shared_data["thermal_active"]:
             shared_data["thermal_active"] = True
-            if self._thermal_overlay is None:
-                self._thermal_overlay = ThermalOverlay(self.thermal_worker)
-            self._thermal_overlay.show()
-            self._thermal_overlay.update()
-            self.thermal_worker.set_active(True)
+            self.thermal_worker.set_thermal(True)
+            self._ensure_radar_view()
+            self._apply_radar_window_size()
+            self._next_view = 0.0
             self.raise_()
+            where = "OVERLAY" if thermal_mode() == "overlay" else "RADAR_VIEW"
+            print(f"[thermal] ON ({where})")
         else:
             shared_data["thermal_active"] = False
-            self.thermal_worker.set_active(False)
-            if self._thermal_overlay is not None:
-                self._thermal_overlay.hide()
+            self.thermal_worker.set_thermal(False)
+            self._maybe_close_radar_view()
             # Настройки тепловизора меняются Num-клавишами; фиксируем их на
             # диск при выключении, не дожидаясь выхода.
             save_config()
+        self.update()
+
+    def toggle_thermal_mode(self) -> None:
+        """Переключает показ тепловизора: мини-окно <-> полноэкранный оверлей."""
+        new_mode = "overlay" if thermal_mode() == "window" else "window"
+        config["THERMAL_MODE"] = new_mode
+        save_config()
+
+        if shared_data["thermal_active"]:
+            if new_mode == "window":
+                self._ensure_radar_view()
+                self._apply_radar_window_size()
+            else:
+                self._maybe_close_radar_view()
+        self._next_view = 0.0
+        self.update()
+        title = "OVERLAY" if new_mode == "overlay" else "RADAR_VIEW"
+        print(f"[thermal] mode: {title}")
+
+    def toggle_fullscan(self) -> None:
+        """Полноэкранный поиск целей по активному профилю, независимо от Q."""
+        if not shared_data["fullscan_active"]:
+            shared_data["fullscan_active"] = True
+            self.thermal_worker.set_fullscan(True)
+            self._ensure_radar_view()
+            self._apply_radar_window_size()
+            self._next_view = 0.0
+            print("[fullscan] ON")
+        else:
+            shared_data["fullscan_active"] = False
+            self.thermal_worker.set_fullscan(False)
+            shared_data["full_targets"] = []
+            shared_data["full_main"] = None
+            self._maybe_close_radar_view()
+            print("[fullscan] OFF")
+        self.update()
 
     def _handle_thermal_hotkeys(self) -> None:
         """Опрашивает Num-клавиши каждый тик, применяет только при активном thermal.
@@ -1635,6 +1933,10 @@ class Overlay(QMainWindow):
             shared_data["tracking_mode"] = not shared_data["tracking_mode"]
         if keys.just_pressed(VK_THERMAL):
             self.toggle_thermal()
+        if keys.just_pressed(VK_FULLSCAN):
+            self.toggle_fullscan()
+        if keys.just_pressed(VK_THERMAL_MODE):
+            self.toggle_thermal_mode()
         if keys.just_pressed(VK_PROFILE):
             self.cycle_profile()
         if keys.just_pressed(VK_ZOOM):
@@ -1653,11 +1955,29 @@ class Overlay(QMainWindow):
             return
 
         active = keys.pressed(VK_SCAN)
+        full_active = bool(shared_data["fullscan_active"])
+        thermal_overlay = bool(
+            shared_data["thermal_active"] and thermal_mode() == "overlay"
+        )
         state_changed = active != self._prev_active
-        if state_changed:
+        full_state_changed = full_active != self._prev_fullscan
+        if state_changed or full_state_changed:
             self._next_view = 0.0
         shared_data["active"] = active
         self.scanner.set_active(active)
+
+        # Полный вид и поиск живут в отдельном воркере: он захватывает всё
+        # окно Roblox даже при отпущенной F.
+        full_snap = self.thermal_worker.snapshot() if (
+            shared_data["thermal_active"] or full_active
+        ) else None
+        if full_active and full_snap is not None:
+            shared_data["full_targets"] = list(full_snap.targets)
+            shared_data["full_main"] = full_snap.main
+        else:
+            shared_data["full_targets"] = []
+            shared_data["full_main"] = None
+        full_main = shared_data["full_main"]
 
         if active:
             targets, main, motion, lock = self.scanner.snapshot()
@@ -1669,7 +1989,9 @@ class Overlay(QMainWindow):
             shared_data["targets"] = targets
             shared_data["main_target"] = main
             shared_data["lock_target"] = lock
-            steer = lock if lock is not None else main
+            # Приоритет: ручной LOCK, затем цель курсорного радара, затем
+            # главная цель полного поиска.
+            steer = lock if lock is not None else (main if main is not None else full_main)
             if shared_data["tracking_mode"] and steer is not None:
                 self.execute_tracking(steer)
         else:
@@ -1686,60 +2008,87 @@ class Overlay(QMainWindow):
                 self.scanner.manual_lock_rect() if self._manual_lock_owned else None
             )
             steer = shared_data["lock_target"]
+            if steer is None and full_active:
+                steer = full_main
             if shared_data["tracking_mode"] and steer is not None:
                 self.execute_tracking(steer)
 
-        self._update_radar_view(targets, motion, active)
+        self._update_radar_view(targets, motion, active, full_snap)
 
         now = time.perf_counter()
-        # Смена состояния (нажал/отпустил F) перерисовывается принудительно:
-        # иначе throttle мог пропустить единственный кадр очистки, и старые
-        # боксы оставались на экране.
-        if state_changed or (
-            (active or self._prev_active or self._manual_lock_owned)
+        # Смена состояния (нажал/отпустил F или H) перерисовывается
+        # принудительно: иначе throttle мог пропустить единственный кадр
+        # очистки, и старые боксы оставались на экране.
+        if state_changed or full_state_changed or (
+            (
+                active
+                or self._prev_active
+                or self._manual_lock_owned
+                or full_active
+                or self._prev_fullscan
+                or thermal_overlay
+            )
             and now >= self._next_paint
         ):
             self._next_paint = now + 0.033
             self.update()
         self._prev_active = active
+        self._prev_fullscan = full_active
 
     # -------- окно RADAR_VIEW --------
 
     def _update_radar_view(
-        self, targets: List[Rect], motion: Optional[np.ndarray], active: bool
+        self,
+        targets: List[Rect],
+        motion: Optional[np.ndarray],
+        active: bool,
+        full_snap: Optional[FullViewSnapshot],
     ) -> None:
-        if not config.get("SHOW_RADAR_VIEW", True):
+        if not self._ensure_radar_view():
             return
         now = time.perf_counter()
         if now < self._next_view:
             return
         self._next_view = now + 0.05
 
-        frame = np.zeros((SQUARE_SIZE, SQUARE_SIZE, 3), dtype=np.uint8)
-        if motion is not None:
-            gain = int(config.get("MOTION_MAP_GAIN", 8))
-            scaled = motion if gain == 1 else cv2.convertScaleAbs(motion, alpha=gain)
-            if scaled.shape[:2] == (SQUARE_SIZE, SQUARE_SIZE):
-                frame = cv2.cvtColor(scaled, cv2.COLOR_GRAY2BGR)
-            else:
-                frame = cv2.cvtColor(
-                    cv2.resize(scaled, (SQUARE_SIZE, SQUARE_SIZE)), cv2.COLOR_GRAY2BGR
-                )
+        thermal_window = bool(
+            shared_data.get("thermal_active") and thermal_mode() == "window"
+        )
+        full_view = bool(shared_data.get("fullscan_active") or thermal_window)
+        if full_view:
+            # В режиме overlay тепловизор уже рисуется поверх экрана, поэтому
+            # мини-окно при H показывает motion map и рамки, без дубля тепла.
+            if thermal_mode() == "overlay" and full_snap is not None:
+                full_snap = full_snap._replace(thermal=None)
+            frame = self._render_full_view(full_snap)
+        else:
+            frame = np.zeros((SQUARE_SIZE, SQUARE_SIZE, 3), dtype=np.uint8)
+            if motion is not None:
+                gain = int(config.get("MOTION_MAP_GAIN", 8))
+                scaled = motion if gain == 1 else cv2.convertScaleAbs(motion, alpha=gain)
+                if scaled.shape[:2] == (SQUARE_SIZE, SQUARE_SIZE):
+                    frame = cv2.cvtColor(scaled, cv2.COLOR_GRAY2BGR)
+                else:
+                    frame = cv2.cvtColor(
+                        cv2.resize(scaled, (SQUARE_SIZE, SQUARE_SIZE)),
+                        cv2.COLOR_GRAY2BGR,
+                    )
 
-        self._draw_radar_status(frame, active, len(targets), self._radar_zoom)
-        lock = shared_data.get("lock_target")
-        if lock is not None:
-            mx, my = win32api.GetCursorPos()
-            half = SQUARE_SIZE // 2
-            lx, ly, lw, lh = lock
-            x1, y1 = lx - (mx - half), ly - (my - half)
-            if x1 + lw > 0 and y1 + lh > 0 and x1 < SQUARE_SIZE and y1 < SQUARE_SIZE:
-                cv2.rectangle(frame, (x1, y1), (x1 + lw, y1 + lh), (255, 255, 0), 1)
-                label_y = y1 - 4 if y1 >= 14 else y1 + lh + 12
-                cv2.putText(
-                    frame, "LOCK", (max(2, x1), min(SQUARE_SIZE - 4, label_y)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1,
-                )
+            self._draw_radar_status(frame, active, len(targets), self._radar_zoom)
+            lock = shared_data.get("lock_target")
+            if lock is not None:
+                mx, my = win32api.GetCursorPos()
+                half = SQUARE_SIZE // 2
+                lx, ly, lw, lh = lock
+                x1, y1 = lx - (mx - half), ly - (my - half)
+                if x1 + lw > 0 and y1 + lh > 0 and x1 < SQUARE_SIZE and y1 < SQUARE_SIZE:
+                    cv2.rectangle(frame, (x1, y1), (x1 + lw, y1 + lh), (255, 255, 0), 1)
+                    label_y = y1 - 4 if y1 >= 14 else y1 + lh + 12
+                    cv2.putText(
+                        frame, "LOCK", (max(2, x1), min(SQUARE_SIZE - 4, label_y)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1,
+                    )
+
         if self._radar_zoom:
             # Увеличиваем уже готовый кадр целиком: карта, перекрестие и
             # подписи растут вместе с окном, пиксели остаются чёткими.
@@ -1752,6 +2101,7 @@ class Overlay(QMainWindow):
         except Exception as exc:
             print(f"[view] {exc}")
             self._radar_hwnd = None
+            self._radar_window_created = False
             return
 
         # FindWindow/SetWindowPos раньше вызывались 60+ раз в секунду; теперь
@@ -1769,6 +2119,255 @@ class Overlay(QMainWindow):
                 except Exception:
                     pass
             self._next_topmost = now + 1.0
+
+    @staticmethod
+    def _full_layout() -> Tuple[int, int]:
+        """Высота верхней панели статуса и нижней подсказки."""
+        top = max(16, int(SQUARE_SIZE * 0.25))
+        bottom = max(10, int(SQUARE_SIZE * 0.08))
+        if top + bottom > SQUARE_SIZE - 32:
+            top = max(16, (SQUARE_SIZE - 32) // 2)
+            bottom = max(10, SQUARE_SIZE - 32 - top)
+        return top, bottom
+
+    @classmethod
+    def _full_geometry(cls, full_size: Tuple[int, int]) -> Optional[Tuple[int, int, int, int]]:
+        """Вписывает клиент Roblox в свободную область RADAR_VIEW."""
+        full_w, full_h = full_size
+        if full_w <= 0 or full_h <= 0:
+            return None
+        top, bottom = cls._full_layout()
+        available_w = SQUARE_SIZE
+        available_h = max(1, SQUARE_SIZE - top - bottom)
+        scale = min(available_w / float(full_w), available_h / float(full_h))
+        width = max(1, int(round(full_w * scale)))
+        height = max(1, int(round(full_h * scale)))
+        x0 = (SQUARE_SIZE - width) // 2
+        y0 = top + (available_h - height) // 2
+        return x0, y0, width, height
+
+    @staticmethod
+    def _map_full_rect(
+        rect: Rect,
+        origin: Tuple[int, int],
+        full_size: Tuple[int, int],
+        geometry: Tuple[int, int, int, int],
+    ) -> Optional[Rect]:
+        """Экранный прямоугольник -> координаты полного вида RADAR_VIEW."""
+        full_w, full_h = full_size
+        if full_w <= 0 or full_h <= 0:
+            return None
+        x0, y0, width, height = geometry
+        rx, ry, rw, rh = rect
+        left = x0 + (rx - origin[0]) * width / float(full_w)
+        top = y0 + (ry - origin[1]) * height / float(full_h)
+        right = left + rw * width / float(full_w)
+        bottom = top + rh * height / float(full_h)
+
+        if right <= x0 or left >= x0 + width or bottom <= y0 or top >= y0 + height:
+            return None
+        x1 = int(round(max(x0, left)))
+        y1 = int(round(max(y0, top)))
+        x2 = int(round(min(x0 + width - 1, right)))
+        y2 = int(round(min(y0 + height - 1, bottom)))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return x1, y1, x2 - x1, y2 - y1
+
+    def _render_full_view(self, snap: Optional[FullViewSnapshot]) -> np.ndarray:
+        """Полное окно Roblox в RADAR_VIEW: тепловая карта или motion map."""
+        frame = np.zeros((SQUARE_SIZE, SQUARE_SIZE, 3), dtype=np.uint8)
+        if snap is None:
+            snap = FullViewSnapshot(
+                None, None, None, [], None, (0, 0), (0, 0), False, 0
+            )
+
+        geometry = self._full_geometry(snap.size)
+        if geometry is not None:
+            x0, y0, width, height = geometry
+            source: Optional[np.ndarray] = None
+            if snap.thermal is not None:
+                source = snap.thermal
+            elif snap.motion is not None:
+                gain = int(config.get("MOTION_MAP_GAIN", 8))
+                scaled = (
+                    snap.motion
+                    if gain == 1
+                    else cv2.convertScaleAbs(snap.motion, alpha=gain)
+                )
+                source = cv2.cvtColor(scaled, cv2.COLOR_GRAY2BGR)
+
+            if source is not None:
+                interpolation = (
+                    cv2.INTER_AREA if source.shape[1] > width else cv2.INTER_NEAREST
+                )
+                resized = cv2.resize(source, (width, height), interpolation=interpolation)
+                frame[y0:y0 + height, x0:x0 + width] = resized
+
+            cv2.rectangle(
+                frame, (x0, y0), (x0 + width - 1, y0 + height - 1), (80, 80, 80), 1
+            )
+
+            # Центр клиента Roblox и позиция курсора.
+            cv2.drawMarker(
+                frame, (x0 + width // 2, y0 + height // 2),
+                (55, 55, 55), cv2.MARKER_CROSS, 6, 1,
+            )
+            mx, my = win32api.GetCursorPos()
+            cursor_x = x0 + int(round((mx - snap.origin[0]) * width / float(snap.size[0])))
+            cursor_y = y0 + int(round((my - snap.origin[1]) * height / float(snap.size[1])))
+            cursor_inside = (
+                0 <= mx - snap.origin[0] < snap.size[0]
+                and 0 <= my - snap.origin[1] < snap.size[1]
+            )
+            if cursor_inside:
+                cv2.drawMarker(
+                    frame, (cursor_x, cursor_y), (0, 255, 0),
+                    cv2.MARKER_CROSS, 8, 1,
+                )
+
+            locked = shared_data.get("lock_target") is not None
+            for rect in snap.targets:
+                mapped = self._map_full_rect(
+                    rect, snap.origin, snap.size, geometry
+                )
+                if mapped is None:
+                    continue
+                tx, ty, tw, th = mapped
+                is_main = (not locked) and rect == snap.main
+                color = (0, 255, 0) if is_main else (0, 175, 90)
+                cv2.rectangle(
+                    frame, (tx, ty), (tx + tw, ty + th), color, 2 if is_main else 1
+                )
+                if is_main:
+                    start = (cursor_x, cursor_y) if cursor_inside else (
+                        x0 + width // 2, y0 + height // 2
+                    )
+                    cv2.line(
+                        frame, start, (tx + tw // 2, ty + th // 2),
+                        (0, 150, 70), 1,
+                    )
+                    label_y = ty - 4 if ty >= 14 else ty + th + 12
+                    cv2.putText(
+                        frame, "FULL", (max(2, tx), min(SQUARE_SIZE - 4, label_y)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1,
+                    )
+
+            lock = shared_data.get("lock_target")
+            if lock is not None:
+                mapped = self._map_full_rect(
+                    lock, snap.origin, snap.size, geometry
+                )
+                if mapped is not None:
+                    lx, ly, lw, lh = mapped
+                    cv2.rectangle(
+                        frame, (lx, ly), (lx + lw, ly + lh), (255, 255, 0), 2
+                    )
+                    label_y = ly - 4 if ly >= 14 else ly + lh + 12
+                    cv2.putText(
+                        frame, "LOCK", (max(2, lx), min(SQUARE_SIZE - 4, label_y)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1,
+                    )
+
+        self._draw_full_status(frame, snap)
+        return frame
+
+    def _draw_full_status(
+        self, frame: np.ndarray, snap: FullViewSnapshot
+    ) -> None:
+        """Короткая сводка в верхней панели полного вида."""
+        height, width = frame.shape[:2]
+        top, bottom = self._full_layout()
+        panel = frame.copy()
+        cv2.rectangle(panel, (0, 0), (width, top), (0, 0, 0), -1)
+        cv2.addWeighted(panel, 0.72, frame, 0.28, 0, frame)
+
+        thermal = bool(shared_data.get("thermal_active"))
+        full = bool(shared_data.get("fullscan_active"))
+        if thermal and full:
+            mode = "THERMAL + FULL"
+        elif thermal:
+            mode = "THERMAL"
+        elif full:
+            mode = "FULL SCAN"
+        else:
+            mode = "IDLE"
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        lock_on = shared_data.get("lock_target") is not None
+        scan_on = bool(shared_data.get("active"))
+        lines = [
+            (
+                f"PROFILE [{CV2_BIND_LABELS['profile']}]: {active_profile.upper()}",
+                (0, 220, 255),
+            ),
+            (
+                f"VIEW: {mode}  ({snap.size[0]}x{snap.size[1]})",
+                (255, 255, 255),
+            ),
+            (
+                f"FULL [{CV2_BIND_LABELS['fullscan']}]: {'ON' if full else 'OFF'}   "
+                f"THERMAL [{CV2_BIND_LABELS['thermal']}]: "
+                f"{'ON' if thermal else 'OFF'} "
+                f"{'OVR' if thermal_mode() == 'overlay' else 'WIN'}",
+                (0, 255, 0) if (full or thermal) else (150, 150, 150),
+            ),
+            (
+                f"TARGETS: {len(snap.targets)}   "
+                f"SCAN [{CV2_BIND_LABELS['scan']}]: {'ON' if scan_on else 'HOLD'}",
+                (0, 255, 0) if snap.targets else (160, 160, 160),
+            ),
+            (
+                f"LOCK [{CV2_BIND_LABELS['capture']}]: {'ON' if lock_on else 'OFF'}   "
+                f"ZOOM [{CV2_BIND_LABELS['zoom']}]: x{2 if self._radar_zoom else 1}",
+                (255, 255, 0) if lock_on else (150, 150, 150),
+            ),
+        ]
+        spacing = max(12, min(18, (top - 8) // 6))
+        font_scale = 0.38 if top >= 80 else 0.32
+        y = spacing + 4
+        for text, color in lines:
+            cv2.putText(frame, text, (10, y), font, font_scale, color, 1)
+            y += spacing
+
+        status_y = min(top - 4, y + 2)
+        if not snap.found:
+            cv2.putText(
+                frame, "ROBLOX WINDOW NOT FOUND", (10, status_y), font,
+                font_scale, (0, 80, 255), 1,
+            )
+        elif snap.thermal is None and snap.motion is None:
+            cv2.putText(
+                frame, "WAITING FOR FRAME", (10, status_y), font,
+                font_scale, (180, 180, 180), 1,
+            )
+
+        # Нижняя подсказка по клавишам.
+        hint_panel = frame.copy()
+        cv2.rectangle(hint_panel, (0, height - bottom), (width, height), (0, 0, 0), -1)
+        cv2.addWeighted(hint_panel, 0.72, frame, 0.28, 0, frame)
+        if bottom >= 26:
+            cv2.putText(
+                frame,
+                f"[{CV2_BIND_LABELS['scan']}] scan  [{CV2_BIND_LABELS['tracking']}] track  "
+                f"[{CV2_BIND_LABELS['thermal']}] thermal  [{CV2_BIND_LABELS['fullscan']}] full  "
+                f"[{CV2_BIND_LABELS['capture']}] lock",
+                (10, height - bottom + 12), font, 0.32, (190, 190, 190), 1,
+            )
+            cv2.putText(
+                frame,
+                f"[{CV2_BIND_LABELS['thermal_mode']}] mode  "
+                f"[{CV2_BIND_LABELS['zoom']}] zoom  "
+                f"[{CV2_BIND_LABELS['hide']}] hide  [ESC] exit",
+                (10, height - 5), font, 0.32, (190, 190, 190), 1,
+            )
+        else:
+            cv2.putText(
+                frame,
+                f"[{CV2_BIND_LABELS['scan']}] scan [{CV2_BIND_LABELS['thermal']}] thermal "
+                f"[{CV2_BIND_LABELS['fullscan']}] full [{CV2_BIND_LABELS['capture']}] lock",
+                (10, height - 4), font, 0.28, (190, 190, 190), 1,
+            )
 
     @staticmethod
     def _draw_radar_status(
@@ -1813,10 +2412,18 @@ class Overlay(QMainWindow):
             )
             cv2.putText(
                 frame,
-                f"[{CV2_BIND_LABELS['tracking']}] track  [{CV2_BIND_LABELS['thermal']}] thermal  "
-                f"[{CV2_BIND_LABELS['zoom']}] zoom  [{CV2_BIND_LABELS['capture']}] lock  "
+                f"[{CV2_BIND_LABELS['tracking']}] track  "
+                f"[{CV2_BIND_LABELS['thermal']}] thermal  "
+                f"[{CV2_BIND_LABELS['fullscan']}] full  "
+                f"[{CV2_BIND_LABELS['thermal_mode']}] mode",
+                (10, h - 24), font, 0.32, (128, 128, 128), 1,
+            )
+            cv2.putText(
+                frame,
+                f"[{CV2_BIND_LABELS['zoom']}] zoom  "
+                f"[{CV2_BIND_LABELS['capture']}] lock  "
                 f"[{CV2_BIND_LABELS['hide']}] hide  [ESC] exit",
-                (10, h - 10), font, 0.33, (128, 128, 128), 1,
+                (10, h - 10), font, 0.32, (128, 128, 128), 1,
             )
             return
 
@@ -1831,8 +2438,16 @@ class Overlay(QMainWindow):
         thermal_color = (255, 220, 0) if shared_data["thermal_active"] else (128, 128, 128)
         cv2.putText(
             frame, f"THERMAL [{CV2_BIND_LABELS['thermal']}]: "
-            f"{'ON' if shared_data['thermal_active'] else 'OFF'}",
+            f"{'ON' if shared_data['thermal_active'] else 'OFF'} "
+            f"{'OVR' if thermal_mode() == 'overlay' else 'WIN'}",
             (10, y), font, 0.5, thermal_color, 1,
+        )
+        y += 20
+        full_color = (0, 255, 0) if shared_data["fullscan_active"] else (128, 128, 128)
+        cv2.putText(
+            frame, f"FULL [{CV2_BIND_LABELS['fullscan']}]: "
+            f"{'ON' if shared_data['fullscan_active'] else 'OFF'}",
+            (10, y), font, 0.5, full_color, 1,
         )
         y += 20
         target_color = (0, 255, 0) if targets_count else (128, 128, 128)
@@ -1851,20 +2466,97 @@ class Overlay(QMainWindow):
                 return
 
             active = bool(shared_data["active"])
+            full = bool(shared_data["fullscan_active"])
             lock = shared_data.get("lock_target")
-            if not active and lock is None:
+            thermal_overlay = bool(
+                shared_data["thermal_active"] and thermal_mode() == "overlay"
+            )
+
+            # Режим overlay: затемняем весь экран и рисуем только горячие
+            # пиксели тепловой карты поверх окна Roblox. Рамки H и радара
+            # рисуются выше, поэтому остаются читаемыми.
+            if thermal_overlay:
+                painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+                painter.fillRect(
+                    self.rect(),
+                    QColor(0, 0, 0, int(THERMAL_SETTINGS["bg_alpha"])),
+                )
+                snap = self.thermal_worker.snapshot()
+                if snap.overlay is not None and snap.size[0] > 0:
+                    key = (id(snap.overlay), snap.overlay.shape)
+                    if key != self._thermal_qimage_key:
+                        height, width = snap.overlay.shape[:2]
+                        # QImage не копирует буфер — держим numpy-массив живым.
+                        self._thermal_qimage_data = snap.overlay
+                        self._thermal_qimage = QImage(
+                            snap.overlay.data,
+                            width,
+                            height,
+                            width * 4,
+                            QImage.Format_ARGB32,
+                        )
+                        self._thermal_qimage_key = key
+                    if (
+                        self._thermal_qimage is not None
+                        and not self._thermal_qimage.isNull()
+                    ):
+                        painter.drawImage(
+                            int(snap.origin[0]),
+                            int(snap.origin[1]),
+                            self._thermal_qimage,
+                        )
+
+                painter.setPen(QPen(QColor(255, 255, 255, 220), 1))
+                painter.setFont(QFont("Consolas", 9, QFont.Bold))
+                painter.drawText(14, 20, "[ THERMAL OVERLAY ]")
+                painter.setFont(QFont("Consolas", 8))
+                painter.setPen(QPen(QColor(210, 210, 210, 220), 1))
+                painter.drawText(
+                    14,
+                    34,
+                    f"THR:{THERMAL_SETTINGS['threshold']}  "
+                    f"DOT:{THERMAL_SETTINGS['dot_size']}px  "
+                    f"STEP:{THERMAL_SETTINGS['sample_step']}  "
+                    f"BG:{THERMAL_SETTINGS['bg_alpha']}  "
+                    f"[{BIND_LABELS['thermal_mode']}] mode",
+                )
+                if not snap.found:
+                    painter.setPen(QPen(QColor(255, 90, 90, 230), 1))
+                    painter.drawText(14, 48, "ROBLOX WINDOW NOT FOUND")
+
+            if not active and lock is None and not full:
                 return
 
             painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
             mx, my = win32api.GetCursorPos()
             half = SQUARE_SIZE // 2
+            locked = lock is not None
+            center_x, center_y = shared_data["screen_center"]
+
+            # Полноэкранный поиск рисует рамки по всему клиенту Roblox и
+            # работает независимо от F и Q. Основная цель — ярче.
+            if full:
+                for rect in shared_data["full_targets"]:
+                    rx, ry, rw, rh = rect
+                    is_main = (not locked) and rect == shared_data["full_main"]
+                    color = QColor(0, 255, 120) if is_main else QColor(90, 220, 140)
+                    painter.setPen(QPen(color, 2 if is_main else 1))
+                    painter.drawRect(rx, ry, rw, rh)
+                    if is_main:
+                        painter.setPen(
+                            QPen(
+                                QColor(color.red(), color.green(), color.blue(), 55),
+                                2, Qt.DashLine,
+                            )
+                        )
+                        painter.drawLine(
+                            center_x, center_y, rx + rw // 2, ry + rh // 2
+                        )
 
             if active:
                 painter.setPen(QPen(QColor(0, 255, 0, 80), 1))
                 painter.drawEllipse(mx - half, my - half, SQUARE_SIZE, SQUARE_SIZE)
 
-                center_x, center_y = shared_data["screen_center"]
-                locked = lock is not None
                 for rect in shared_data["targets"]:
                     rx, ry, rw, rh = rect
                     # При ручном захвате радарные блобы вторичны: не подсвечиваем
@@ -1903,75 +2595,16 @@ class Overlay(QMainWindow):
             self.scanner.stop()
             self.thermal_worker.stop()
             save_config()
-            if config.get("SHOW_RADAR_VIEW", True):
+            if self._radar_window_created:
                 try:
                     cv2.destroyAllWindows()
                 except Exception:
                     pass
+                self._radar_window_created = False
         finally:
             app = QApplication.instance()
             if app is not None:
                 app.quit()
-
-# ==================== THERMAL OVERLAY ====================
-
-class ThermalOverlay(QMainWindow):
-    def __init__(self, worker: ThermalWorker) -> None:
-        super().__init__()
-        self.sw = win32api.GetSystemMetrics(0)
-        self.sh = win32api.GetSystemMetrics(1)
-        self.setWindowFlags(
-            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowTransparentForInput
-        )
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setGeometry(0, 0, self.sw, self.sh)
-        self._worker = worker
-
-        # Раньше было два таймера (скан 50 мс + перерисовка 16 мс) и до 20 000
-        # fillRect с QColor на кадр. Теперь поток отдаёт готовый RGBA-слой,
-        # а таймер только перерисовывает его с частотой данных.
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self.update)
-        self._timer.start(50)
-
-    def paintEvent(self, event) -> None:
-        if not shared_data["thermal_active"]:
-            return
-
-        rgba, origin, found, count = self._worker.snapshot()
-        painter = QPainter(self)
-        try:
-            alpha = int(THERMAL_SETTINGS["bg_alpha"])
-            painter.fillRect(0, 0, self.sw, self.sh, QColor(0, 0, 0, alpha))
-
-            if rgba is not None:
-                height, width = rgba.shape[:2]
-                image = QImage(rgba.data, width, height, width * 4, QImage.Format_ARGB32)
-                painter.drawImage(int(origin[0]), int(origin[1]), image)
-
-            painter.setPen(QPen(QColor(255, 255, 255, 220), 1))
-            painter.setFont(QFont("Consolas", 10, QFont.Bold))
-            painter.drawText(14, 20, "[ THERMAL ]  ROBLOX MOTION DETECTOR")
-
-            painter.setFont(QFont("Consolas", 8))
-            if found:
-                painter.drawText(
-                    14, 34,
-                    f"Dots:{count}  THR:{THERMAL_SETTINGS['threshold']}  "
-                    f"DOT:{THERMAL_SETTINGS['dot_size']}px  "
-                    f"STEP:{THERMAL_SETTINGS['sample_step']}  "
-                    f"BG:{THERMAL_SETTINGS['bg_alpha']} | "
-                    f"{CV2_BIND_LABELS['thermal']}=close",
-                )
-            else:
-                painter.setPen(QPen(QColor(255, 80, 80, 220), 1))
-                painter.drawText(
-                    14, 34,
-                    f"Roblox Player not found! | {CV2_BIND_LABELS['thermal']} = close",
-                )
-        finally:
-            painter.end()
-
 
 # ==================== ЗАПУСК ====================
 

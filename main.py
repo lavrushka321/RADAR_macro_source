@@ -27,7 +27,7 @@ from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PyQt5.QtWidgets import QApplication, QMainWindow
 
 
-__version__ = "beta-2.10 (local)"
+__version__ = "beta-2.11 (local)"
 
 RADAR_WINDOW_TITLE = "RADAR_VIEW"
 
@@ -895,15 +895,9 @@ class ScanWorker(threading.Thread):
                 self._targets = []
                 self._main = None
                 self._motion = None
-                # Шаблон и последнюю рамку не теряем: захват остаётся
-                # включённым, пока его не снимут T/Ё. Рамка просто замирает
-                # на последней позиции; после повторного F поиск продолжится.
-                self._manual_misses = 0
-                self._manual_velocity = (0.0, 0.0)
-                self._manual_lost_at = None
-                # Отменяем незавершённый скан, чтобы он не перезаписал
-                # замороженную рамку уже после отпускания F.
-                self._manual_generation += 1
+                # Ручной захват живёт независимо от F: его состояние не
+                # сбрасываем. Поток сканера продолжит искать шаблон в фоне,
+                # даже когда радарный поиск выключен.
 
     def set_manual_lock(
         self,
@@ -954,8 +948,27 @@ class ScanWorker(threading.Thread):
 
     def run(self) -> None:
         while not self._stop_evt.is_set():
-            if not self._active_evt.wait(0.1):
+            if not self._active_evt.is_set():
+                with self._lock:
+                    has_lock = self._manual_template is not None
+                if not has_lock:
+                    # Ждём F или новый ручной захват (T).
+                    self._active_evt.wait(0.05)
+                    continue
+                # F отпущена, но хардлок продолжает искать цель в фоне.
+                started = time.perf_counter()
+                try:
+                    tracked = self._track_manual_only()
+                except Exception as exc:
+                    print(f"[lock] {exc}")
+                    tracked = False
+                delay = self._interval - (time.perf_counter() - started)
+                if not tracked:
+                    delay = max(delay, 0.1)
+                if delay > 0:
+                    self._stop_evt.wait(delay)
                 continue
+
             with self._lock:
                 profile = dict(self._profile)
                 size = self._size
@@ -983,6 +996,18 @@ class ScanWorker(threading.Thread):
             delay = interval - (time.perf_counter() - started)
             if delay > 0:
                 self._stop_evt.wait(delay)
+
+    def _track_manual_only(self) -> bool:
+        """Ищет только ручной захват, без радарного детектора движения."""
+        with self._lock:
+            if self._manual_template is None:
+                return False
+        captured = capture_roblox_window()
+        if captured is None:
+            return False
+        gray, origin = captured
+        self._update_manual_lock(gray, origin)
+        return True
 
     def _scan(
         self, profile: Dict[str, Any], size: int
@@ -1655,11 +1680,14 @@ class Overlay(QMainWindow):
             targets, main, motion = [], None, None
             shared_data["targets"] = []
             shared_data["main_target"] = None
-            # Захват при отпущенном F не снимается: рамка замирает на
-            # последней позиции и снова начнёт обновляться при нажатии F.
+            # Захват при отпущенном F не снимается: сканер продолжает искать
+            # шаблон в фоне и обновляет рамку.
             shared_data["lock_target"] = (
                 self.scanner.manual_lock_rect() if self._manual_lock_owned else None
             )
+            steer = shared_data["lock_target"]
+            if shared_data["tracking_mode"] and steer is not None:
+                self.execute_tracking(steer)
 
         self._update_radar_view(targets, motion, active)
 
@@ -1667,7 +1695,10 @@ class Overlay(QMainWindow):
         # Смена состояния (нажал/отпустил F) перерисовывается принудительно:
         # иначе throttle мог пропустить единственный кадр очистки, и старые
         # боксы оставались на экране.
-        if state_changed or ((active or self._prev_active) and now >= self._next_paint):
+        if state_changed or (
+            (active or self._prev_active or self._manual_lock_owned)
+            and now >= self._next_paint
+        ):
             self._next_paint = now + 0.033
             self.update()
         self._prev_active = active

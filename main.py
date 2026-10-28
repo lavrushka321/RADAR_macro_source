@@ -23,12 +23,21 @@ import win32con
 import win32gui
 import win32process
 
+try:
+    # Именно pydirectinput отправляет скан-коды, которые принимает Roblox.
+    # Если пакета нет, ниже есть резерв через keybd_event.
+    import pydirectinput
+    pydirectinput.PAUSE = 0
+    pydirectinput.FAILSAFE = False
+except Exception:
+    pydirectinput = None
+
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PyQt5.QtWidgets import QApplication, QMainWindow
 
 
-__version__ = "beta-3.4 (local)"
+__version__ = "beta-3.7 (local)"
 
 RADAR_WINDOW_TITLE = "RADAR_VIEW"
 
@@ -54,19 +63,30 @@ enable_dpi_awareness()
 CONFIG_DIR = Path.home() / ".radar_macro"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "CONFIG_VERSION": CONFIG_VERSION,
     "SQUARE_SIZE": 400,
     "SCAN_INTERVAL": 0.05,
     "SHOW_RADAR_VIEW": True,
+    # X: normal / far / near. Меняет размер шаблона и рамки LOCK:
+    # far — меньше, near — больше, normal — template_size.
+    "LOCK_SIZE_MODE": "normal",
     # new - TV-прицел, normal - обычный курсор без TV-обвязки.
     "INTERFACE_MODE": "new",
-    # N: на время центрирования зажать RMB, чтобы в Roblox работал обзор
-    # камеры (актуально для третьего лица). Если игра в первом лице или RMB
-    # занят, можно выключить.
-    "CENTER_AUTO_RMB": True,
+    # N: корректировка цели удержанием клавиш A/D/W/S. Курсор не двигается,
+    # каждая серия удержания ограничена CENTER_HOLD_SECONDS (1 секунда).
+    "CENTER_USE_KEYS": True,
+    "CENTER_KEY_LEFT": "A",
+    "CENTER_KEY_RIGHT": "D",
+    "CENTER_KEY_UP": "W",
+    "CENTER_KEY_DOWN": "S",
+    "CENTER_HOLD_SECONDS": 1.0,
+    "CENTER_REST_SECONDS": 0.15,
+    # Только для старого режима CENTER_USE_KEYS=false: зажимать RMB, чтобы
+    # камера Roblox слушала относительное движение мыши.
+    "CENTER_AUTO_RMB": False,
     # Усиление сырой карты движения в окне RADAR_VIEW (до масок она тёмная).
     "MOTION_MAP_GAIN": 8,
     "ACTIVE_PROFILE": "precision",
@@ -118,19 +138,29 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     # не нашёл цель). Шаблон ищется только рядом с прошлой позицией и
     # переживает короткие перекрытия (трассеры, вспышки).
     "LOCK_SETTINGS": {
+        # normal — template_size; far/near — меньший/больший шаблон.
         "template_size": 48,
+        "far_size": 32,
+        "near_size": 64,
         "search_margin": 40,
         "wide_margin": 120,
         "match_min": 0.45,
-        "wide_match_min": 0.60,
-        "max_misses": 8,
+        "wide_match_min": 0.55,
+        # Больше промахов до режима lost: короткие перекрытия и смена
+        # фона не должны снимать хардлок.
+        "max_misses": 20,
         # После обычных промахов захват не сбрасывается сразу: ещё
         # lost_timeout секунд шаблон ищется в радиусе lost_margin вокруг
         # последней позиции (цель может выйти из кадра/уйти за укрытие).
-        "lost_margin": 220,
-        "lost_timeout": 2.0,
-        "lost_match_min": 0.70,
-        "update_score": 0.85,
+        "lost_margin": 260,
+        "lost_timeout": 5.0,
+        "lost_match_min": 0.65,
+        "update_score": 0.78,
+        # Банк эталонов: центральные области цели на разных фонах.
+        # Это не даёт хардлоку зависеть от одного фона.
+        "template_bank_size": 4,
+        "bank_add_score": 0.72,
+        "bank_diff_min": 10.0,
     },
     "THERMAL_SETTINGS": {
         "threshold": 7,
@@ -156,6 +186,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         # Удержание ПКМ: цифровой TV-прицел вокруг курсора (игра/тепловизор).
         "key_zoom_hold": "RMB",
         "key_capture": "T",
+        # Размер хардлока: normal -> far -> near (меньше/больше шаблон).
+        "key_lock_mode": "X",
         # Удержание выбранной цели в центре экрана во время WASD.
         "key_center_hold": "N",
         "key_exit": "ESCAPE",
@@ -271,11 +303,34 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
     cfg["SQUARE_SIZE"] = _as_int(cfg.get("SQUARE_SIZE"), 400, 64, 2000)
     cfg["SCAN_INTERVAL"] = _as_float(cfg.get("SCAN_INTERVAL"), 0.05, 0.005, 0.5)
     cfg["SHOW_RADAR_VIEW"] = bool(cfg.get("SHOW_RADAR_VIEW", True))
+    lock_mode = str(cfg.get("LOCK_SIZE_MODE", "normal")).strip().lower()
+    if lock_mode not in ("normal", "far", "near"):
+        lock_mode = "normal"
+    cfg["LOCK_SIZE_MODE"] = lock_mode
     interface_mode = str(cfg.get("INTERFACE_MODE", "new")).strip().lower()
     if interface_mode not in ("new", "normal"):
         interface_mode = "new"
     cfg["INTERFACE_MODE"] = interface_mode
-    cfg["CENTER_AUTO_RMB"] = bool(cfg.get("CENTER_AUTO_RMB", True))
+    cfg["CENTER_USE_KEYS"] = bool(cfg.get("CENTER_USE_KEYS", True))
+    for key in (
+        "CENTER_KEY_LEFT", "CENTER_KEY_RIGHT",
+        "CENTER_KEY_UP", "CENTER_KEY_DOWN",
+    ):
+        value = cfg.get(key, DEFAULT_SETTINGS[key])
+        try:
+            resolve_vk(str(value))
+        except ValueError:
+            print(f"[config] неверная клавиша {key}={value!r}, беру "
+                  f"{DEFAULT_SETTINGS[key]!r}")
+            value = DEFAULT_SETTINGS[key]
+        cfg[key] = str(value)
+    cfg["CENTER_HOLD_SECONDS"] = round(
+        _as_float(cfg.get("CENTER_HOLD_SECONDS"), 1.0, 0.1, 1.0), 2
+    )
+    cfg["CENTER_REST_SECONDS"] = round(
+        _as_float(cfg.get("CENTER_REST_SECONDS"), 0.15, 0.0, 2.0), 2
+    )
+    cfg["CENTER_AUTO_RMB"] = bool(cfg.get("CENTER_AUTO_RMB", False))
     cfg["MOTION_MAP_GAIN"] = _as_int(cfg.get("MOTION_MAP_GAIN"), 8, 1, 32)
 
     lock = cfg.get("LOCK_SETTINGS")
@@ -283,29 +338,45 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
         lock = copy.deepcopy(DEFAULT_SETTINGS["LOCK_SETTINGS"])
         cfg["LOCK_SETTINGS"] = lock
     lock["template_size"] = _as_int(lock.get("template_size"), 48, 16, 160)
+    lock["far_size"] = _as_int(lock.get("far_size"), 32, 16, 160)
+    lock["near_size"] = _as_int(lock.get("near_size"), 64, 16, 160)
+    # far должен быть не больше normal, near — не меньше normal.
+    if lock["far_size"] > lock["template_size"]:
+        lock["far_size"] = lock["template_size"]
+    if lock["near_size"] < lock["template_size"]:
+        lock["near_size"] = lock["template_size"]
     lock["search_margin"] = _as_int(lock.get("search_margin"), 40, 8, 300)
     lock["wide_margin"] = _as_int(lock.get("wide_margin"), 120, 8, 500)
     if lock["wide_margin"] < lock["search_margin"]:
         lock["wide_margin"] = lock["search_margin"]
     lock["match_min"] = round(_as_float(lock.get("match_min"), 0.45, 0.05, 0.95), 2)
     lock["wide_match_min"] = round(
-        _as_float(lock.get("wide_match_min"), 0.60, 0.05, 0.99), 2
+        _as_float(lock.get("wide_match_min"), 0.55, 0.05, 0.99), 2
     )
     if lock["wide_match_min"] < lock["match_min"]:
         lock["wide_match_min"] = lock["match_min"]
-    lock["max_misses"] = _as_int(lock.get("max_misses"), 8, 0, 60)
-    lock["lost_margin"] = _as_int(lock.get("lost_margin"), 220, 8, 800)
+    lock["max_misses"] = _as_int(lock.get("max_misses"), 20, 0, 120)
+    lock["lost_margin"] = _as_int(lock.get("lost_margin"), 260, 8, 900)
     if lock["lost_margin"] < lock["wide_margin"]:
         lock["lost_margin"] = lock["wide_margin"]
     lock["lost_timeout"] = round(
-        _as_float(lock.get("lost_timeout"), 2.0, 0.0, 10.0), 2
+        _as_float(lock.get("lost_timeout"), 5.0, 0.0, 15.0), 2
     )
     lock["lost_match_min"] = round(
-        _as_float(lock.get("lost_match_min"), 0.70, 0.05, 0.99), 2
+        _as_float(lock.get("lost_match_min"), 0.65, 0.05, 0.99), 2
     )
     if lock["lost_match_min"] < lock["wide_match_min"]:
         lock["lost_match_min"] = lock["wide_match_min"]
-    lock["update_score"] = round(_as_float(lock.get("update_score"), 0.85, 0.5, 0.99), 2)
+    lock["update_score"] = round(_as_float(lock.get("update_score"), 0.78, 0.5, 0.99), 2)
+    lock["template_bank_size"] = _as_int(
+        lock.get("template_bank_size"), 4, 0, 8
+    )
+    lock["bank_add_score"] = round(
+        _as_float(lock.get("bank_add_score"), 0.72, 0.0, 0.99), 2
+    )
+    lock["bank_diff_min"] = round(
+        _as_float(lock.get("bank_diff_min"), 10.0, 0.0, 100.0), 2
+    )
 
     _validate_profiles(cfg)
     profiles = cfg["SEARCH_PROFILES"]
@@ -371,10 +442,26 @@ def load_config() -> Dict[str, Any]:
         raw_version = int(raw.get("CONFIG_VERSION", 0))
     except (TypeError, ValueError):
         raw_version = 0
-    if raw_version < CONFIG_VERSION:
+    if raw_version < 3:
         profiles = raw.get("SEARCH_PROFILES")
         if isinstance(profiles, dict) and "noise" in profiles:
             profiles["noise"] = copy.deepcopy(DEFAULT_SETTINGS["SEARCH_PROFILES"]["noise"])
+    if raw_version < 4:
+        # v4: хардлок стал устойчивее к смене фона и дольше держится.
+        # Меняем только старые дефолты; ручные настройки пользователя не трогаем.
+        lock = raw.get("LOCK_SETTINGS")
+        if isinstance(lock, dict):
+            for key, old, new in (
+                ("wide_match_min", 0.60, 0.55),
+                ("max_misses", 8, 20),
+                ("lost_margin", 220, 260),
+                ("lost_timeout", 2.0, 5.0),
+                ("lost_match_min", 0.70, 0.65),
+                ("update_score", 0.85, 0.78),
+            ):
+                if lock.get(key) == old:
+                    lock[key] = new
+    if raw_version < CONFIG_VERSION:
         raw["CONFIG_VERSION"] = CONFIG_VERSION
 
     # Старый конфиг без профилей: переносим его значения в профиль "precision",
@@ -514,9 +601,59 @@ def interface_is_new() -> bool:
     return str(config.get("INTERFACE_MODE", "new")).strip().lower() != "normal"
 
 
+LOCK_SIZE_MODES: Tuple[str, ...] = ("normal", "far", "near")
+LOCK_MODE_TITLES: Dict[str, str] = {
+    "normal": "NORMAL",
+    "far": "FAR",
+    "near": "NEAR",
+}
+LOCK_MODE_SIZE_KEYS: Dict[str, str] = {
+    "normal": "template_size",
+    "far": "far_size",
+    "near": "near_size",
+}
+LOCK_MODE_DEFAULT_SIZES: Dict[str, int] = {
+    "normal": 48,
+    "far": 32,
+    "near": 64,
+}
+
+
+def lock_size_mode() -> str:
+    """Текущий режим размера хардлока: normal, far или near."""
+    mode = str(config.get("LOCK_SIZE_MODE", "normal")).strip().lower()
+    return mode if mode in LOCK_SIZE_MODES else "normal"
+
+
+def lock_mode_title() -> str:
+    """ASCII-подпись режима для RADAR_VIEW/оверлея."""
+    return LOCK_MODE_TITLES[lock_size_mode()]
+
+
+def lock_template_size(mode: Optional[str] = None) -> int:
+    """Размер шаблона и рамки LOCK для текущего/заданного режима."""
+    name = mode if mode in LOCK_SIZE_MODES else lock_size_mode()
+    key = LOCK_MODE_SIZE_KEYS[name]
+    default = LOCK_MODE_DEFAULT_SIZES[name]
+    try:
+        size = int(LOCK_SETTINGS.get(key, default))
+    except (TypeError, ValueError):
+        size = default
+    if name == "far" and "template_size" in LOCK_SETTINGS:
+        size = min(size, int(LOCK_SETTINGS["template_size"]))
+    elif name == "near" and "template_size" in LOCK_SETTINGS:
+        size = max(size, int(LOCK_SETTINGS["template_size"]))
+    return max(16, min(160, size))
+
+
+def center_use_keys() -> bool:
+    """N корректирует удержанием A/D/W/S, а не движением курсора."""
+    return bool(config.get("CENTER_USE_KEYS", True))
+
+
 def center_auto_rmb() -> bool:
-    """Зажимать RMB на время N, чтобы камера Roblox слушала мышь."""
-    return bool(config.get("CENTER_AUTO_RMB", True))
+    """Старый режим: зажимать RMB, чтобы камера Roblox слушала мышь."""
+    return bool(config.get("CENTER_AUTO_RMB", False))
 
 
 _binds_cfg: Dict[str, Any] = config["BINDS"]
@@ -541,6 +678,7 @@ VK_PROFILE = _bind("key_profile", "G")
 VK_ZOOM = _bind("key_zoom", "Z")
 VK_ZOOM_HOLD = _bind("key_zoom_hold", "RMB")
 VK_CAPTURE = _bind("key_capture", "T")
+VK_LOCK_MODE = _bind("key_lock_mode", "X")
 VK_CENTER_HOLD = _bind("key_center_hold", "N")
 VK_EXIT = _bind("key_exit", "ESCAPE")
 VK_HIDE = _bind("key_hide", "Ё")
@@ -551,7 +689,8 @@ BIND_LABELS: Dict[str, str] = {
         ("scan", "F"), ("thermal", "Q"), ("fullscan", "H"),
         ("thermal_mode", "Y"), ("tracking", "V"), ("profile", "G"),
         ("zoom", "Z"), ("zoom_hold", "RMB"), ("capture", "T"),
-        ("center_hold", "N"), ("exit", "ESCAPE"), ("hide", "Ё"),
+        ("lock_mode", "X"), ("center_hold", "N"),
+        ("exit", "ESCAPE"), ("hide", "Ё"),
     )
 }
 
@@ -931,6 +1070,8 @@ class ScanWorker(threading.Thread):
         # Ручной захват: шаблон внешнего вида + последняя позиция в координатах
         # клиентской области окна. Живёт независимо от детектора движения.
         self._manual_template: Optional[np.ndarray] = None
+        # Дополнительные эталоны внешнего вида: цель на разных фонах/ракурсах.
+        self._manual_template_bank: List[np.ndarray] = []
         self._manual_center: Tuple[float, float] = (0.0, 0.0)
         self._manual_last_seen: Optional[Tuple[float, float]] = None
         self._manual_velocity: Tuple[float, float] = (0.0, 0.0)
@@ -981,6 +1122,7 @@ class ScanWorker(threading.Thread):
         """Захватить цель по шаблону из точки под курсором."""
         with self._lock:
             self._manual_template = template.copy()
+            self._manual_template_bank = []
             self._manual_center = (float(center[0]), float(center[1]))
             self._manual_last_seen = (float(center[0]), float(center[1]))
             self._manual_velocity = (0.0, 0.0)
@@ -993,6 +1135,7 @@ class ScanWorker(threading.Thread):
     def clear_manual_lock(self) -> None:
         with self._lock:
             self._manual_template = None
+            self._manual_template_bank = []
             self._manual_rect = None
             self._manual_last_seen = None
             self._manual_score = 0.0
@@ -1165,9 +1308,23 @@ class ScanWorker(threading.Thread):
         template: np.ndarray,
         center: Tuple[float, float],
         margin: int,
+        crop: float = 1.0,
     ) -> Optional[Tuple[Tuple[float, float], float]]:
+        """Сопоставляет шаблон; crop<1 сравнивает только центр цели.
+
+        Фон вокруг цели часто меняется (трава, стена, небо), а вместе с ним
+        меняется и обычный 48x48-шаблон. Центральный кроп оставляет только
+        саму цель, поэтому LOCK не привязан к одному фону.
+        """
         h, w = gray.shape
         th, tw = template.shape[:2]
+        if crop < 0.999:
+            cw = max(8, int(round(tw * crop)))
+            ch = max(8, int(round(th * crop)))
+            cx0 = (tw - cw) // 2
+            cy0 = (th - ch) // 2
+            template = template[cy0:cy0 + ch, cx0:cx0 + cw]
+            th, tw = template.shape[:2]
         if w < tw or h < th:
             return None
         left = max(0, int(round(center[0] - tw / 2.0 - margin)))
@@ -1185,6 +1342,59 @@ class ScanWorker(threading.Thread):
         )
         return matched, float(max_val)
 
+    def _match_any_template(
+        self,
+        gray: np.ndarray,
+        templates: List[np.ndarray],
+        center: Tuple[float, float],
+        margin: int,
+        crops: Tuple[float, ...] = (1.0, 0.75, 0.55, 0.40),
+        min_score: Optional[float] = None,
+    ) -> Optional[Tuple[Tuple[float, float], float, int]]:
+        """Лучшее совпадение по банку эталонов и нескольким кропам.
+
+        Возвращает (центр, score, индекс): индекс 0 — основной эталон,
+        остальные — дополнительные из банка. Если min_score задан, поиск
+        прекращается на первом уверенном совпадении — это сильно экономит
+        CPU в обычном режиме и при широком/lost-поиске.
+        """
+        best: Optional[Tuple[Tuple[float, float], float, int]] = None
+        for index, template in enumerate(templates):
+            for crop in crops:
+                found = self._match_template(gray, template, center, margin, crop)
+                if found is None:
+                    continue
+                if best is None or found[1] > best[1]:
+                    best = (found[0], found[1], index)
+                    if min_score is not None and found[1] >= min_score:
+                        return best
+        return best
+
+    @staticmethod
+    def _blend_center(
+        old: np.ndarray, new: np.ndarray, alpha: float = 0.2
+    ) -> np.ndarray:
+        """Обновляет только центр эталона, чтобы фон не «впечатывался»."""
+        if old.shape != new.shape:
+            return old.copy()
+        h, w = old.shape[:2]
+        ch = max(8, int(round(h * 0.60)))
+        cw = max(8, int(round(w * 0.60)))
+        y0 = (h - ch) // 2
+        x0 = (w - cw) // 2
+        result = old.copy()
+        result[y0:y0 + ch, x0:x0 + cw] = cv2.addWeighted(
+            old[y0:y0 + ch, x0:x0 + cw], 1.0 - alpha,
+            new[y0:y0 + ch, x0:x0 + cw], alpha, 0,
+        )
+        return result
+
+    @staticmethod
+    def _patch_difference(a: np.ndarray, b: np.ndarray) -> float:
+        if a.shape != b.shape:
+            return float("inf")
+        return float(np.mean(cv2.absdiff(a, b)))
+
     def _update_manual_lock(self, gray: np.ndarray, origin: Tuple[int, int]) -> None:
         """Ведёт цель по шаблону и не сдаётся сразу после промахов.
 
@@ -1198,6 +1408,10 @@ class ScanWorker(threading.Thread):
             template = self._manual_template
             if template is None:
                 return
+            bank = [
+                item for item in self._manual_template_bank
+                if item.shape == template.shape
+            ]
             center = self._manual_center
             last_seen = self._manual_last_seen or center
             velocity = self._manual_velocity
@@ -1211,16 +1425,25 @@ class ScanWorker(threading.Thread):
             with self._lock:
                 if generation == self._manual_generation:
                     self._manual_template = None
+                    self._manual_template_bank = []
                     self._manual_rect = None
                     self._manual_last_seen = None
                     self._manual_lost_at = None
             return
 
+        templates = [template] + bank
+        # Для широкого и lost-поиска достаточно основного эталона и двух
+        # последних снимков банка: полный перебор всех кропов на большом
+        # радиусе слишком дорог, а свежие эталоны полезнее старых.
+        recent_templates = [template] + bank[-2:]
         predicted = (center[0] + velocity[0], center[1] + velocity[1])
         settings = LOCK_SETTINGS
         max_misses = int(settings["max_misses"])
-        match = self._match_template(
-            gray, template, predicted, int(settings["search_margin"])
+        match = self._match_any_template(
+            gray, templates, predicted, int(settings["search_margin"]),
+            # Ранний выход только при уверенном совпадении: если основной
+            # шаблон дал пограничный score, стоит проверить кропы и банк.
+            min_score=max(float(settings["match_min"]), 0.80),
         )
         accepted = match is not None and match[1] >= float(settings["match_min"])
         lost_mode = not accepted and misses + 1 > max_misses
@@ -1229,8 +1452,10 @@ class ScanWorker(threading.Thread):
         if not accepted and not lost_mode and misses % 2 == 0:
             # Широкий поиск не каждый скан: он дороже, а нужен только когда
             # цель резко сместилась или её кратко перекрыли.
-            wide = self._match_template(
-                gray, template, predicted, int(settings["wide_margin"])
+            wide = self._match_any_template(
+                gray, recent_templates, predicted, int(settings["wide_margin"]),
+                crops=(0.75, 0.55, 0.40),
+                min_score=float(settings["wide_match_min"]),
             )
             if (
                 wide is not None
@@ -1241,14 +1466,17 @@ class ScanWorker(threading.Thread):
                 accepted = True
                 lost_mode = False
 
-        if not accepted and lost_mode:
+        if not accepted and lost_mode and misses % 2 == 0:
             # Обычный лимит промахов исчерпан: продолжаем искать в большем
             # радиусе вокруг последней подтверждённой позиции. Более высокий
-            # порог lost_match_min защищает от ложного захвата фона.
+            # порог lost_match_min защищает от ложного захвата фона. Lost-поиск
+            # идёт через скан: 5 секунд удержания важнее лишних 100 мс задержки.
             if lost_at is None:
                 lost_at = now
-            lost = self._match_template(
-                gray, template, last_seen, int(settings["lost_margin"])
+            lost = self._match_any_template(
+                gray, recent_templates, last_seen, int(settings["lost_margin"]),
+                crops=(0.75, 0.55, 0.40),
+                min_score=float(settings["lost_match_min"]),
             )
             if lost is not None and lost[1] >= float(settings["lost_match_min"]):
                 match = lost
@@ -1256,7 +1484,7 @@ class ScanWorker(threading.Thread):
                 matched_via_lost = True
 
         if accepted and match is not None:
-            new_center, score = match
+            new_center, score, matched_index = match
             dx = new_center[0] - center[0]
             dy = new_center[1] - center[1]
             jump = (dx * dx + dy * dy) ** 0.5
@@ -1275,15 +1503,39 @@ class ScanWorker(threading.Thread):
             misses = 0
             lost_at = None
             last_seen = new_center
-            # Обновляем шаблон только при уверенном совпадении, чтобы трассер
-            # или вспышка не «впечатались» в эталон. Для lost-поиска порог
-            # обновления ещё выше: слабое совпадение не должно уводить эталон.
-            if score >= float(settings["update_score"]) and (
+            patch = self._patch_at(gray, new_center, tw, th)
+
+            # Обновляем только центр эталона, чтобы новый фон не «впечатался».
+            # Слабые lost-совпадения не трогают эталон.
+            update_ok = score >= float(settings["update_score"]) and (
                 not matched_via_lost or score >= 0.90
+            )
+            if patch is not None and update_ok:
+                if matched_index == 0:
+                    template = self._blend_center(template, patch)
+                elif 0 < matched_index <= len(bank):
+                    bank[matched_index - 1] = self._blend_center(
+                        bank[matched_index - 1], patch
+                    )
+
+            # Новый фон/ракурс — добавляем снимок в банк. Так следующие сканы
+            # могут совпасть уже с ним, а не только со старым фоном.
+            bank_size = int(settings.get("template_bank_size", 4))
+            if (
+                patch is not None
+                and bank_size > 0
+                and score >= float(settings.get("bank_add_score", 0.72))
+                and (not matched_via_lost or score >= 0.80)
             ):
-                patch = self._patch_at(gray, new_center, tw, th)
-                if patch is not None:
-                    template = cv2.addWeighted(template, 0.8, patch, 0.2, 0)
+                diff_min = float(settings.get("bank_diff_min", 10.0))
+                known = [template] + bank
+                if all(
+                    self._patch_difference(patch, item) > diff_min
+                    for item in known
+                ):
+                    if len(bank) >= bank_size:
+                        bank.pop(0)
+                    bank.append(patch.copy())
         else:
             misses += 1
             if lost_mode:
@@ -1313,6 +1565,7 @@ class ScanWorker(threading.Thread):
         )
         if misses > max_misses and lost_expired:
             template = None
+            bank = []
             rect: Optional[Rect] = None
             score = 0.0
             last_seen = None
@@ -1327,6 +1580,7 @@ class ScanWorker(threading.Thread):
             if generation != self._manual_generation:
                 return
             self._manual_template = template
+            self._manual_template_bank = bank
             self._manual_center = new_center
             self._manual_last_seen = last_seen
             self._manual_velocity = velocity
@@ -1671,6 +1925,10 @@ class Overlay(QMainWindow):
         self._center_progress_at = 0.0
         self._center_pause_until = 0.0
         self._center_warned = False
+        # Клавиши A/D/W/S, которые зажал именно макрос (чужие не отпускаем).
+        self._center_keys_owned: Dict[str, Tuple[str, Any]] = {}
+        self._center_keys_started = 0.0
+        self._center_rest_until = 0.0
 
         # Кэш BGRA-слоя тепловизора для полноэкранного оверлея: QImage
         # ссылается на numpy-буфер, поэтому храним и сам массив.
@@ -1809,7 +2067,7 @@ class Overlay(QMainWindow):
             shared_data["full_main"] = None
             shared_data["zoom_hold"] = False
             shared_data["center_hold"] = False
-            self._set_center_rmb(False)
+            self._release_center_inputs()
             self.clear_manual_lock()
             self.scanner.set_active(False)
             self.thermal_worker.set_thermal(False)
@@ -1946,6 +2204,90 @@ class Overlay(QMainWindow):
             pass
         self._center_rmb_sent = False
 
+    def _press_center_key(self, name: str) -> None:
+        """Зажимает клавишу коррекции, но не трогает уже зажатую пользователем."""
+        raw = str(name or "").strip()
+        if not raw:
+            return
+        ident = raw.upper()
+        if ident in self._center_keys_owned:
+            return
+        try:
+            vk = resolve_vk(raw)
+        except ValueError:
+            return
+        try:
+            # Если клавишу уже держит игрок, не перехватываем её: иначе на
+            # отпускании серии мы оторвём его собственное движение.
+            if win32api.GetAsyncKeyState(vk) & 0x8000:
+                return
+        except Exception:
+            pass
+
+        pd_name = raw.lower()
+        if pydirectinput is not None:
+            try:
+                mapping = getattr(pydirectinput, "KEYBOARD_MAPPING", {})
+                if pd_name in mapping:
+                    pydirectinput.keyDown(pd_name)
+                    self._center_keys_owned[ident] = ("pd", pd_name)
+                    return
+            except Exception:
+                pass
+        try:
+            win32api.keybd_event(vk, 0, 0, 0)
+            self._center_keys_owned[ident] = ("vk", vk)
+        except Exception:
+            pass
+
+    def _release_center_key(self, ident: str) -> None:
+        spec = self._center_keys_owned.pop(ident, None)
+        if spec is None:
+            return
+        kind, code = spec
+        if kind == "pd" and pydirectinput is not None:
+            try:
+                pydirectinput.keyUp(str(code))
+                return
+            except Exception:
+                pass
+        try:
+            try:
+                vk = int(code)
+            except (TypeError, ValueError):
+                vk = resolve_vk(str(code))
+            win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+        except Exception:
+            pass
+
+    def _release_center_keys(self, reset: bool = True) -> None:
+        for ident in list(self._center_keys_owned):
+            self._release_center_key(ident)
+        if reset:
+            self._center_keys_started = 0.0
+
+    def _sync_center_keys(self, names: List[str]) -> None:
+        wanted: Dict[str, str] = {}
+        for name in names:
+            raw = str(name or "").strip()
+            if raw:
+                wanted[raw.upper()] = raw
+        for ident in list(self._center_keys_owned):
+            if ident not in wanted:
+                self._release_center_key(ident)
+        for ident, raw in wanted.items():
+            if ident not in self._center_keys_owned:
+                self._press_center_key(raw)
+
+    def _release_center_inputs(self) -> None:
+        self._release_center_keys()
+        self._set_center_rmb(False)
+
+    def _reset_center_progress(self, now: Optional[float] = None) -> None:
+        """Новая цель/центр/потеря фокуса — начинаем прогресс заново."""
+        self._center_best_error = float("inf")
+        self._center_progress_at = time.perf_counter() if now is None else now
+
     def _input_allowed(self) -> bool:
         return self._roblox_is_foreground() and not self._cursor_over_radar_view()
 
@@ -1961,37 +2303,77 @@ class Overlay(QMainWindow):
         except Exception:
             pass
 
-    def execute_center_hold(self, rect: Rect) -> None:
-        """Плавно возвращает цель в центр экрана.
+    def _key_center_step(self, ex: int, ey: int, now: float) -> None:
+        """Одна серия коррекции удержанием A/D/W/S, не дольше 1 секунды."""
+        self._set_center_rmb(False)  # старый режим RMB больше не используем
+        if now < self._center_rest_until:
+            self._release_center_keys()
+            return
 
-        Макрос не перехватывает WASD: игра обрабатывает движение как обычно,
-        а мы каждый тик компенсируем смещение цели относительно центра.
+        left = str(config.get("CENTER_KEY_LEFT", "A"))
+        right = str(config.get("CENTER_KEY_RIGHT", "D"))
+        up = str(config.get("CENTER_KEY_UP", "W"))
+        down = str(config.get("CENTER_KEY_DOWN", "S"))
+        wanted: List[str] = []
+        if ex > CENTER_DEADZONE:
+            wanted.append(right)
+        elif ex < -CENTER_DEADZONE:
+            wanted.append(left)
+        if ey > CENTER_DEADZONE:
+            wanted.append(down)
+        elif ey < -CENTER_DEADZONE:
+            wanted.append(up)
+        if not wanted:
+            self._release_center_inputs()
+            self._center_rest_until = 0.0
+            return
+
+        if self._center_keys_started <= 0.0:
+            self._center_keys_started = now
+        hold = float(config.get("CENTER_HOLD_SECONDS", 1.0))
+        rest = float(config.get("CENTER_REST_SECONDS", 0.15))
+        if now - self._center_keys_started >= hold:
+            self._release_center_keys()
+            self._center_rest_until = now + rest
+            return
+        self._sync_center_keys(wanted)
+
+    def execute_center_hold(self, rect: Rect) -> None:
+        """Возвращает цель в центр экрана удержанием клавиш коррекции.
+
+        Курсор не двигается: макрос зажимает A/D/W/S (настраивается) на одну
+        серию не дольше CENTER_HOLD_SECONDS, затем отпускает и делает паузу.
         """
         now = time.perf_counter()
         if now < self._center_next:
             return
         self._center_next = now + CENTER_INTERVAL
         if not self._input_allowed():
-            self._set_center_rmb(False)
+            self._release_center_inputs()
+            self._center_rest_until = 0.0
+            self._reset_center_progress(now)
             return
         if now < self._center_pause_until:
-            self._set_center_rmb(False)
+            self._release_center_inputs()
             return
 
         cx, cy = shared_data.get("client_center", (0, 0))
         if cx <= 0 or cy <= 0:
             cx, cy = shared_data["screen_center"]
         if cx <= 0 or cy <= 0:
+            self._release_center_inputs()
+            self._reset_center_progress(now)
             return
         tx, ty = self.target_center(rect)
         ex, ey = tx - cx, ty - cy
         if abs(ex) <= CENTER_DEADZONE and abs(ey) <= CENTER_DEADZONE:
-            self._set_center_rmb(False)
+            self._release_center_inputs()
+            self._center_rest_until = 0.0
+            self._reset_center_progress(now)
             return
 
-        # Защита от бесконечного увода курсора: если цель не приближается
-        # к центру, значит камера не реагирует (нет обзора RMB, игра не в
-        # фокусе и т.п.). Останавливаемся, чтобы не утащить курсор в угол.
+        # Защита от бесконечной коррекции: если цель не приближается к центру,
+        # значит выбраны не те клавиши или игра не принимает ввод.
         error = math.hypot(ex, ey)
         if error < self._center_best_error - 1.0:
             self._center_best_error = error
@@ -2000,20 +2382,24 @@ class Overlay(QMainWindow):
             self._center_pause_until = now + 0.7
             self._center_best_error = float("inf")
             self._center_progress_at = now
-            self._set_center_rmb(False)
+            self._release_center_inputs()
+            self._center_rest_until = 0.0
             if not self._center_warned:
+                mode = "CENTER_KEY_*" if center_use_keys() else "RMB"
                 print(
                     "[aim] center hold: цель не реагирует — "
-                    "нужен обзор RMB (CENTER_AUTO_RMB) или 1-е лицо"
+                    f"проверьте {mode}"
                 )
                 self._center_warned = True
             return
 
-        # Важно: именно относительное движение мыши, а не SetCursorPos.
-        # При absolute-позиции курсор быстро упирается в одну точку, и после
-        # первого тика relative-дельта равна нулю — камера перестаёт
-        # доворачиваться. mouse_event каждый тик даёт игре новую дельту,
-        # поэтому WASD-стабилизация работает непрерывно.
+        if center_use_keys():
+            self._key_center_step(ex, ey, now)
+            return
+
+        # Старый режим (CENTER_USE_KEYS=false): относительное движение мыши.
+        # Оставлен как запасной вариант, по умолчанию выключен.
+        self._release_center_keys()
         dx = int(round(ex * CENTER_GAIN))
         dy = int(round(ey * CENTER_GAIN))
         dx = max(-CENTER_MAX_STEP, min(CENTER_MAX_STEP, dx))
@@ -2035,13 +2421,16 @@ class Overlay(QMainWindow):
 
     def toggle_center_hold(self) -> None:
         shared_data["center_hold"] = not bool(shared_data["center_hold"])
+        self._release_center_inputs()
         if shared_data["center_hold"]:
             self._center_best_error = float("inf")
             self._center_progress_at = time.perf_counter()
             self._center_pause_until = 0.0
             self._center_warned = False
+            self._center_rest_until = 0.0
+            self._center_keys_started = 0.0
         else:
-            self._set_center_rmb(False)
+            self._center_rest_until = 0.0
         state = "ON" if shared_data["center_hold"] else "OFF"
         print(f"[aim] center hold {state}")
         self.update()
@@ -2184,7 +2573,7 @@ class Overlay(QMainWindow):
             return
 
         gray, origin = captured
-        size = int(LOCK_SETTINGS["template_size"])
+        size = lock_template_size()
         mx, my = win32api.GetCursorPos()
         h, w = gray.shape
         if not (
@@ -2252,7 +2641,58 @@ class Overlay(QMainWindow):
         self.scanner.set_manual_lock(patch, center, screen_rect)
         shared_data["lock_target"] = screen_rect
         self.update()
-        print(f"[lock] {'switched' if switching else 'captured'} ({size}x{size})")
+        print(
+            f"[lock] {'switched' if switching else 'captured'} "
+            f"({size}x{size}, {lock_mode_title()})"
+        )
+
+    def _resize_manual_lock(self, size: int) -> bool:
+        """Пересоздаёт шаблон LOCK вокруг текущей цели с новым размером."""
+        current = self.scanner.manual_lock_rect()
+        if current is None:
+            return False
+        captured = capture_roblox_window()
+        if captured is None:
+            print("[lock] окно Roblox не найдено для смены размера")
+            return False
+        gray, origin = captured
+        h, w = gray.shape
+        if size > w or size > h:
+            print(f"[lock] размер {size} больше окна Roblox")
+            return False
+        cx, cy = self.target_center(current)
+        left = int(round(cx - origin[0] - size / 2.0))
+        top = int(round(cy - origin[1] - size / 2.0))
+        left = max(0, min(w - size, left))
+        top = max(0, min(h - size, top))
+        patch = gray[top:top + size, left:left + size].copy()
+        if float(patch.std()) < 2.0:
+            print("[lock] не удалось переснять цель для нового размера")
+            return False
+        center = (left + size / 2.0, top + size / 2.0)
+        rect = (origin[0] + left, origin[1] + top, size, size)
+        self.scanner.set_manual_lock(patch, center, rect)
+        shared_data["lock_target"] = rect
+        return True
+
+    def cycle_lock_size_mode(self) -> None:
+        """X: normal -> far -> near. Меняет размер шаблона и рамки LOCK."""
+        previous = lock_size_mode()
+        index = LOCK_SIZE_MODES.index(previous)
+        mode = LOCK_SIZE_MODES[(index + 1) % len(LOCK_SIZE_MODES)]
+        size = lock_template_size(mode)
+
+        if self._manual_lock_owned and self.scanner.manual_lock_rect() is not None:
+            if not self._resize_manual_lock(size):
+                # Не оставляем интерфейс с новым режимом, но старым шаблоном.
+                self.update()
+                print(f"[lock] size mode: {previous.upper()} (не изменён)")
+                return
+
+        config["LOCK_SIZE_MODE"] = mode
+        save_config()
+        self.update()
+        print(f"[lock] size mode: {mode.upper()} ({size}x{size})")
 
     def _finish_manual_lock(self, reason: str) -> None:
         """Снимает захват; выключает V, только если захват сам его включил."""
@@ -2388,6 +2828,8 @@ class Overlay(QMainWindow):
             self.toggle_radar_zoom()
         if keys.just_pressed(VK_CAPTURE):
             self.toggle_manual_lock()
+        if keys.just_pressed(VK_LOCK_MODE):
+            self.cycle_lock_size_mode()
         if keys.just_pressed(VK_CENTER_HOLD):
             self.toggle_center_hold()
         self._handle_thermal_hotkeys()
@@ -2483,9 +2925,11 @@ class Overlay(QMainWindow):
                 elif shared_data["tracking_mode"]:
                     self.execute_tracking(steer)
 
-        # Если N выключен или цели нет — не держим RMB зажатым.
+        # Если N выключен или цели нет — не держим клавиши/RMB зажатыми.
         if center_target is None:
-            self._set_center_rmb(False)
+            self._release_center_inputs()
+            self._center_rest_until = 0.0
+            self._reset_center_progress()
 
         self._update_radar_view(targets, motion, active, full_snap)
 
@@ -2875,18 +3319,23 @@ class Overlay(QMainWindow):
             ),
             (
                 f"LOCK [{CV2_BIND_LABELS['capture']}]: {'ON' if lock_on else 'OFF'}   "
-                f"ZOOM [{CV2_BIND_LABELS['zoom']}]: x{2 if self._radar_zoom else 1}",
+                f"SIZE [{CV2_BIND_LABELS['lock_mode']}]: "
+                f"{lock_mode_title()} {lock_template_size()}",
                 (245, 245, 245) if lock_on else (150, 150, 150),
             ),
             (
+                f"ZOOM [{CV2_BIND_LABELS['zoom']}]: x{2 if self._radar_zoom else 1}   "
                 f"LENS [{CV2_BIND_LABELS['zoom_hold']}]: "
-                f"{'ON' if zoom_hold else 'OFF'}   "
+                f"{'ON' if zoom_hold else 'OFF'}",
+                (0, 255, 0) if zoom_hold else (150, 150, 150),
+            ),
+            (
                 f"CENTER [{CV2_BIND_LABELS['center_hold']}]: "
                 f"{'ON' if center_hold else 'OFF'}",
-                (0, 255, 0) if (zoom_hold or center_hold) else (150, 150, 150),
+                (0, 255, 0) if center_hold else (150, 150, 150),
             ),
         ]
-        spacing = max(11, min(16, (top - 8) // 7))
+        spacing = max(10, min(16, (top - 8) // max(1, len(lines) + 1)))
         font_scale = 0.35 if top >= 80 else 0.30
         y = spacing + 4
         for text, color in lines:
@@ -2920,6 +3369,7 @@ class Overlay(QMainWindow):
             cv2.putText(
                 frame,
                 f"[{CV2_BIND_LABELS['thermal_mode']}] mode  "
+                f"[{CV2_BIND_LABELS['lock_mode']}] size  "
                 f"[{CV2_BIND_LABELS['zoom']}] zoom  "
                 f"[{CV2_BIND_LABELS['zoom_hold']}] lens  "
                 f"[{CV2_BIND_LABELS['hide']}] hide  [ESC] exit",
@@ -3027,7 +3477,9 @@ class Overlay(QMainWindow):
         cv2.putText(
             frame,
             f"LOCK [{CV2_BIND_LABELS['capture']}]: "
-            f"{'ON' if shared_data.get('lock_target') else 'OFF'}",
+            f"{'ON' if shared_data.get('lock_target') else 'OFF'}   "
+            f"SIZE [{CV2_BIND_LABELS['lock_mode']}]: "
+            f"{lock_mode_title()} {lock_template_size()}",
             (10, 92), font, 0.4, lock_color, 1,
         )
 
@@ -3048,6 +3500,7 @@ class Overlay(QMainWindow):
                 frame,
                 f"[{CV2_BIND_LABELS['zoom']}] zoom  "
                 f"[{CV2_BIND_LABELS['capture']}] lock  "
+                f"[{CV2_BIND_LABELS['lock_mode']}] size  "
                 f"[{CV2_BIND_LABELS['center_hold']}] center  "
                 f"[{CV2_BIND_LABELS['hide']}] hide",
                 (10, h - 10), font, 0.32, (128, 128, 128), 1,
@@ -3401,7 +3854,7 @@ class Overlay(QMainWindow):
             self.timer.stop()
             self.scanner.stop()
             self.thermal_worker.stop()
-            self._set_center_rmb(False)
+            self._release_center_inputs()
             save_config()
             if self._radar_window_created:
                 try:

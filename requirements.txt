@@ -1,0 +1,6 @@
+# Python 3.11+
+PyQt5>=5.15.10,<6
+opencv-python>=4.8,<5
+numpy>=1.24,<3
+pywin32>=306
+pydirectinput>=1.0.4,<2

@@ -24,8 +24,6 @@ import win32gui
 import win32process
 
 try:
-    # Именно pydirectinput отправляет скан-коды, которые принимает Roblox.
-    # Если пакета нет, ниже есть резерв через keybd_event.
     import pydirectinput
     pydirectinput.PAUSE = 0
     pydirectinput.FAILSAFE = False
@@ -37,7 +35,7 @@ from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PyQt5.QtWidgets import QApplication, QMainWindow
 
 
-__version__ = "beta-3.7 (local)"
+__version__ = "beta-3.7 (max)"
 
 RADAR_WINDOW_TITLE = "RADAR_VIEW"
 
@@ -53,12 +51,8 @@ def enable_dpi_awareness() -> None:
             pass
 
 
-# Вызывается до QApplication и GetSystemMetrics: иначе при масштабировании
-# Windows оверлей и координаты целей окажутся в разных системах координат.
 enable_dpi_awareness()
 
-
-# ==================== КОНФИГ ====================
 
 CONFIG_DIR = Path.home() / ".radar_macro"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -70,13 +64,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "SQUARE_SIZE": 400,
     "SCAN_INTERVAL": 0.05,
     "SHOW_RADAR_VIEW": True,
-    # X: normal / far / near. Меняет размер шаблона и рамки LOCK:
-    # far — меньше, near — больше, normal — template_size.
     "LOCK_SIZE_MODE": "normal",
-    # new - TV-прицел, normal - обычный курсор без TV-обвязки.
     "INTERFACE_MODE": "new",
-    # N: корректировка цели удержанием клавиш A/D/W/S. Курсор не двигается,
-    # каждая серия удержания ограничена CENTER_HOLD_SECONDS (1 секунда).
     "CENTER_USE_KEYS": True,
     "CENTER_KEY_LEFT": "A",
     "CENTER_KEY_RIGHT": "D",
@@ -84,10 +73,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "CENTER_KEY_DOWN": "S",
     "CENTER_HOLD_SECONDS": 1.0,
     "CENTER_REST_SECONDS": 0.15,
-    # Только для старого режима CENTER_USE_KEYS=false: зажимать RMB, чтобы
-    # камера Roblox слушала относительное движение мыши.
     "CENTER_AUTO_RMB": False,
-    # Усиление сырой карты движения в окне RADAR_VIEW (до масок она тёмная).
     "MOTION_MAP_GAIN": 8,
     "ACTIVE_PROFILE": "precision",
     "SEARCH_PROFILES": {
@@ -113,32 +99,20 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
             "threshold": 20,
             "dilate": 21,
             "blur": 3,
-            # Убирает одиночные пиксели шума до дилатации, чтобы они не
-            # склеивались в крупные ложные блобы.
             "open": 3,
             "min_seed": 30,
             "min_area": 120,
             "max_area": 8000,
-            # Плотность контура и вытянутость: трава/ветки дают тонкие
-            # и разреженные блобы, цель — компактный.
             "min_fill": 0.2,
             "max_aspect": 4.0,
-            # При повороте камеры меняется почти весь кадр — пропускаем такой
-            # скан, чтобы не сыпать ложными целями.
             "max_motion_ratio": 0.85,
-            # Порог автоматически поднимается на подвижном фоне.
             "adaptive": True,
             "min_hits": 3,
-            # Один пропущенный скан не сбрасывает подтверждение цели.
             "max_misses": 1,
             "match_dist": 48,
         },
     },
-    # Ручной захват по шаблону внешнего вида (работает, даже если радар
-    # не нашёл цель). Шаблон ищется только рядом с прошлой позицией и
-    # переживает короткие перекрытия (трассеры, вспышки).
     "LOCK_SETTINGS": {
-        # normal — template_size; far/near — меньший/больший шаблон.
         "template_size": 48,
         "far_size": 32,
         "near_size": 64,
@@ -146,18 +120,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "wide_margin": 120,
         "match_min": 0.45,
         "wide_match_min": 0.55,
-        # Больше промахов до режима lost: короткие перекрытия и смена
-        # фона не должны снимать хардлок.
         "max_misses": 20,
-        # После обычных промахов захват не сбрасывается сразу: ещё
-        # lost_timeout секунд шаблон ищется в радиусе lost_margin вокруг
-        # последней позиции (цель может выйти из кадра/уйти за укрытие).
         "lost_margin": 260,
         "lost_timeout": 5.0,
         "lost_match_min": 0.65,
         "update_score": 0.78,
-        # Банк эталонов: центральные области цели на разных фонах.
-        # Это не даёт хардлоку зависеть от одного фона.
         "template_bank_size": 4,
         "bank_add_score": 0.72,
         "bank_diff_min": 10.0,
@@ -169,26 +136,18 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "bg_alpha": 140,
         "max_dots": 20000,
     },
-    # window  — тепловая карта в мини-окне RADAR_VIEW;
-    # overlay — полупрозрачный слой на весь экран.
     "THERMAL_MODE": "window",
     "BINDS": {
         "key_scan": "F",
         "key_thermal": "Q",
-        # Полноэкранный поиск целей по активному профилю. Работает отдельно
-        # от тепловизора: Q показывает тепловую карту, H ищет цели.
         "key_fullscan": "H",
-        # Переключение места показа тепловизора: окно RADAR_VIEW / оверлей.
         "key_thermal_mode": "Y",
         "key_tracking": "V",
         "key_profile": "G",
         "key_zoom": "Z",
-        # Удержание ПКМ: цифровой TV-прицел вокруг курсора (игра/тепловизор).
         "key_zoom_hold": "RMB",
         "key_capture": "T",
-        # Размер хардлока: normal -> far -> near (меньше/больше шаблон).
         "key_lock_mode": "X",
-        # Удержание выбранной цели в центре экрана во время WASD.
         "key_center_hold": "N",
         "key_exit": "ESCAPE",
         "key_hide": "Ё",
@@ -233,7 +192,7 @@ def _as_float(value: Any, default: float, low: float, high: float) -> float:
         number = float(value)
     except (TypeError, ValueError):
         return default
-    if number != number:  # NaN
+    if number != number:
         return default
     return max(low, min(high, number))
 
@@ -340,7 +299,6 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
     lock["template_size"] = _as_int(lock.get("template_size"), 48, 16, 160)
     lock["far_size"] = _as_int(lock.get("far_size"), 32, 16, 160)
     lock["near_size"] = _as_int(lock.get("near_size"), 64, 16, 160)
-    # far должен быть не больше normal, near — не меньше normal.
     if lock["far_size"] > lock["template_size"]:
         lock["far_size"] = lock["template_size"]
     if lock["near_size"] < lock["template_size"]:
@@ -404,8 +362,6 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
 
     _validate_binds(cfg)
 
-    # После миграции значения живут в SEARCH_PROFILES; старые ключи убираем,
-    # чтобы не было двух источников правды.
     for legacy in ("THRESHOLD_VAL", "MIN_TARGET", "MAX_MAP_AREA"):
         cfg.pop(legacy, None)
 
@@ -435,9 +391,6 @@ def load_config() -> Dict[str, Any]:
                 except OSError:
                     pass
 
-    # Миграция формата профилей. В версии 3 профиль "noise" получил
-    # адаптивный порог, открытие, фильтры формы и допуск пропущенных сканов —
-    # старые значения заменяем новыми дефолтами. Профиль precision не трогаем.
     try:
         raw_version = int(raw.get("CONFIG_VERSION", 0))
     except (TypeError, ValueError):
@@ -447,8 +400,6 @@ def load_config() -> Dict[str, Any]:
         if isinstance(profiles, dict) and "noise" in profiles:
             profiles["noise"] = copy.deepcopy(DEFAULT_SETTINGS["SEARCH_PROFILES"]["noise"])
     if raw_version < 4:
-        # v4: хардлок стал устойчивее к смене фона и дольше держится.
-        # Меняем только старые дефолты; ручные настройки пользователя не трогаем.
         lock = raw.get("LOCK_SETTINGS")
         if isinstance(lock, dict):
             for key, old, new in (
@@ -464,8 +415,6 @@ def load_config() -> Dict[str, Any]:
     if raw_version < CONFIG_VERSION:
         raw["CONFIG_VERSION"] = CONFIG_VERSION
 
-    # Старый конфиг без профилей: переносим его значения в профиль "precision",
-    # чтобы поведение после обновления не изменилось.
     if "SEARCH_PROFILES" not in raw:
         precision = copy.deepcopy(DEFAULT_SETTINGS["SEARCH_PROFILES"]["precision"])
         precision["threshold"] = raw.get("THRESHOLD_VAL", precision["threshold"])
@@ -502,8 +451,6 @@ def save_config() -> None:
         print(f"[config] не удалось сохранить настройки: {exc}")
 
 
-# ==================== КЛАВИШИ ====================
-
 _SPECIAL_VK: Dict[str, int] = {
     "ESCAPE": win32con.VK_ESCAPE, "ESC": win32con.VK_ESCAPE,
     "F1": win32con.VK_F1, "F2": win32con.VK_F2, "F3": win32con.VK_F3,
@@ -527,7 +474,6 @@ _SPECIAL_VK: Dict[str, int] = {
     "ADD": win32con.VK_ADD, "SUBTRACT": win32con.VK_SUBTRACT,
     "MULTIPLY": win32con.VK_MULTIPLY, "DIVIDE": win32con.VK_DIVIDE,
     "DECIMAL": win32con.VK_DECIMAL,
-    # Мышиные кнопки опрашиваются тем же GetAsyncKeyState, что и клавиши.
     "LMB": win32con.VK_LBUTTON, "MOUSE1": win32con.VK_LBUTTON,
     "RMB": win32con.VK_RBUTTON, "MOUSE2": win32con.VK_RBUTTON,
     "MMB": win32con.VK_MBUTTON, "MOUSE3": win32con.VK_MBUTTON,
@@ -547,7 +493,6 @@ def resolve_vk(key_name: str) -> int:
         return _SPECIAL_VK[name]
 
     if len(raw) == 1:
-        # Для ASCII-букв и цифр VK совпадает с кодом символа при любой раскладке.
         if "A" <= name <= "Z" or "0" <= name <= "9":
             return ord(name)
         vk = win32api.VkKeyScan(raw) & 0xFF
@@ -557,20 +502,15 @@ def resolve_vk(key_name: str) -> int:
     raise ValueError(f"неизвестная клавиша: {raw!r}")
 
 
-# ==================== НАСТРОЙКИ ====================
-
 config: Dict[str, Any] = load_config()
 
 SQUARE_SIZE = int(config["SQUARE_SIZE"])
 SCAN_INTERVAL = float(config["SCAN_INTERVAL"])
-# Цифровой TV-прицел по удержанию RMB.
 ZOOM_HOLD_FACTOR = 2.0
 ZOOM_LENS_FRACTION = 0.50
 ZOOM_LENS_MIN = 360
 ZOOM_LENS_MAX = 760
-# Захват ищет цель не строго под курсором, а в этом радиусе.
 CAPTURE_RADIUS = 180
-# Удержание цели в центре экрана (N).
 CENTER_DEADZONE = 8
 CENTER_GAIN = 0.45
 CENTER_MAX_STEP = 18
@@ -694,9 +634,6 @@ BIND_LABELS: Dict[str, str] = {
     )
 }
 
-# cv2.putText не умеет кириллицу — для окна RADAR_VIEW и полного вида
-# держим ASCII-вариант подписей. Ё — рабочая клавиша скрытия, поэтому
-# показываем её транслитерацией, а не вопросительным знаком.
 def _cv2_label(label: str) -> str:
     if label == "Ё":
         return "YO"
@@ -732,8 +669,6 @@ class KeyState:
 keys = KeyState()
 
 
-# ==================== СОСТОЯНИЕ ====================
-
 shared_data: Dict[str, Any] = {
     "active": False,
     "tracking_mode": False,
@@ -750,7 +685,6 @@ shared_data: Dict[str, Any] = {
     "client_center": (0, 0),
 }
 
-# ==================== ЗАХВАТ ОКНА ====================
 
 class BITMAPINFOHEADER(ctypes.Structure):
     _fields_ = [
@@ -766,8 +700,6 @@ class BITMAPINFOHEADER(ctypes.Structure):
 _gdi32 = ctypes.windll.gdi32
 _user32 = ctypes.windll.user32
 
-# Явные прототипы: без argtypes/restype ctypes считает хендлы 32-битными и
-# на x64 может обрезать указатель.
 _gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
 _gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
 _gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
@@ -822,8 +754,6 @@ def find_roblox_hwnd() -> Optional[int]:
     own_pid = os.getpid()
 
     def _callback(hwnd: int, _param: Any) -> bool:
-        # Окно может исчезнуть между EnumWindows и проверкой — не роняем
-        # перечисление из-за одного такого окна.
         try:
             if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
                 return True
@@ -879,9 +809,6 @@ def capture_roblox_window() -> Optional[Tuple[np.ndarray, Tuple[int, int]]]:
         if not _user32.PrintWindow(hwnd, mem_dc, flags):
             _gdi32.BitBlt(mem_dc, 0, 0, width, height, window_dc, 0, 0, SRCCOPY_CAPTUREBLT)
 
-        # 32 бита на пиксель: stride всегда width*4, без выравнивания строк и
-        # без записи за пределы буфера (в 24-битном режиме stride добивается
-        # до 4 байт, а буфер выделялся ровно width*height*3).
         bmi = BITMAPINFOHEADER(
             biSize=ctypes.sizeof(BITMAPINFOHEADER), biWidth=width, biHeight=-height,
             biPlanes=1, biBitCount=32, biCompression=0,
@@ -902,7 +829,6 @@ def capture_roblox_window() -> Optional[Tuple[np.ndarray, Tuple[int, int]]]:
             _gdi32.DeleteDC(mem_dc)
         win32gui.ReleaseDC(hwnd, window_dc)
 
-# ==================== ПОИСК ЦЕЛЕЙ ====================
 
 Rect = Tuple[int, int, int, int]
 
@@ -995,8 +921,6 @@ def analyze_motion(
 
     threshold = int(profile["threshold"])
     if profile.get("adaptive"):
-        # 98-й процентиль отражает фон, а не маленькую цель: на спокойном
-        # кадре он низкий и порог остаётся базовым, на подвижном — растёт.
         high = float(np.percentile(diff, 98))
         threshold = max(threshold, min(255, int(high * 0.5)))
 
@@ -1012,8 +936,6 @@ def analyze_motion(
             thresh, cv2.MORPH_OPEN, np.ones((open_size, open_size), dtype=np.uint8)
         )
 
-    # Отсекаем слишком маленькие «семена» до дилатации: иначе одно пятно
-    # шума после расширения на 21 px превращается в блоб, проходящий min_area.
     min_seed = int(profile.get("min_seed", 0))
     if min_seed > 0:
         count, labels, stats, _ = cv2.connectedComponentsWithStats(thresh, connectivity=8)
@@ -1067,10 +989,7 @@ class ScanWorker(threading.Thread):
         self._prev_gray: Optional[np.ndarray] = None
         self._prev_origin: Optional[Tuple[int, int]] = None
 
-        # Ручной захват: шаблон внешнего вида + последняя позиция в координатах
-        # клиентской области окна. Живёт независимо от детектора движения.
         self._manual_template: Optional[np.ndarray] = None
-        # Дополнительные эталоны внешнего вида: цель на разных фонах/ракурсах.
         self._manual_template_bank: List[np.ndarray] = []
         self._manual_center: Tuple[float, float] = (0.0, 0.0)
         self._manual_last_seen: Optional[Tuple[float, float]] = None
@@ -1109,9 +1028,6 @@ class ScanWorker(threading.Thread):
                 self._targets = []
                 self._main = None
                 self._motion = None
-                # Ручной захват живёт независимо от F: его состояние не
-                # сбрасываем. Поток сканера продолжит искать шаблон в фоне,
-                # даже когда радарный поиск выключен.
 
     def set_manual_lock(
         self,
@@ -1168,10 +1084,8 @@ class ScanWorker(threading.Thread):
                 with self._lock:
                     has_lock = self._manual_template is not None
                 if not has_lock:
-                    # Ждём F или новый ручной захват (T).
                     self._active_evt.wait(0.05)
                     continue
-                # F отпущена, но хардлок продолжает искать цель в фоне.
                 started = time.perf_counter()
                 try:
                     tracked = self._track_manual_only()
@@ -1208,7 +1122,6 @@ class ScanWorker(threading.Thread):
                 )
                 self._motion = motion
 
-            # Держим целевой период, но не копим очередь кадров.
             delay = interval - (time.perf_counter() - started)
             if delay > 0:
                 self._stop_evt.wait(delay)
@@ -1255,14 +1168,11 @@ class ScanWorker(threading.Thread):
         self._prev_gray = gray
         self._prev_origin = origin
 
-        # Ручной захват ведётся по полному кадру окна и не зависит от того,
-        # попала ли цель в квадрат радара или в детектор движения.
         self._update_manual_lock(gray, origin)
 
         client_h, client_w = gray.shape
         mx, my = win32api.GetCursorPos()
         half = size // 2
-        # Квадрат поиска вокруг курсора, но только внутри клиентской области.
         left = mx - origin[0] - half
         top = my - origin[1] - half
         x0 = max(0, left)
@@ -1273,13 +1183,10 @@ class ScanWorker(threading.Thread):
             return [], blank
 
         if prev_gray is None or prev_origin != origin or prev_gray.shape != gray.shape:
-            # Первый кадр после включения/перемещения окна: нужно два кадра.
             return [], blank
 
         raw = cv2.absdiff(prev_gray[y0:y1, x0:x1], gray[y0:y1, x0:x1])
 
-        # Сырая карта движения до threshold/blur/морфологии — её показывает
-        # окно RADAR_VIEW.
         motion = blank.copy()
         motion[y0 - top:y1 - top, x0 - left:x1 - left] = raw
 
@@ -1289,7 +1196,6 @@ class ScanWorker(threading.Thread):
             targets.append((origin[0] + x0 + tx, origin[1] + y0 + ty, tw, th))
         return targets, motion
 
-    # -------- ручной захват --------
 
     @staticmethod
     def _patch_at(
@@ -1432,17 +1338,12 @@ class ScanWorker(threading.Thread):
             return
 
         templates = [template] + bank
-        # Для широкого и lost-поиска достаточно основного эталона и двух
-        # последних снимков банка: полный перебор всех кропов на большом
-        # радиусе слишком дорог, а свежие эталоны полезнее старых.
         recent_templates = [template] + bank[-2:]
         predicted = (center[0] + velocity[0], center[1] + velocity[1])
         settings = LOCK_SETTINGS
         max_misses = int(settings["max_misses"])
         match = self._match_any_template(
             gray, templates, predicted, int(settings["search_margin"]),
-            # Ранний выход только при уверенном совпадении: если основной
-            # шаблон дал пограничный score, стоит проверить кропы и банк.
             min_score=max(float(settings["match_min"]), 0.80),
         )
         accepted = match is not None and match[1] >= float(settings["match_min"])
@@ -1450,8 +1351,6 @@ class ScanWorker(threading.Thread):
         matched_via_lost = False
 
         if not accepted and not lost_mode and misses % 2 == 0:
-            # Широкий поиск не каждый скан: он дороже, а нужен только когда
-            # цель резко сместилась или её кратко перекрыли.
             wide = self._match_any_template(
                 gray, recent_templates, predicted, int(settings["wide_margin"]),
                 crops=(0.75, 0.55, 0.40),
@@ -1467,10 +1366,6 @@ class ScanWorker(threading.Thread):
                 lost_mode = False
 
         if not accepted and lost_mode and misses % 2 == 0:
-            # Обычный лимит промахов исчерпан: продолжаем искать в большем
-            # радиусе вокруг последней подтверждённой позиции. Более высокий
-            # порог lost_match_min защищает от ложного захвата фона. Lost-поиск
-            # идёт через скан: 5 секунд удержания важнее лишних 100 мс задержки.
             if lost_at is None:
                 lost_at = now
             lost = self._match_any_template(
@@ -1489,8 +1384,6 @@ class ScanWorker(threading.Thread):
             dy = new_center[1] - center[1]
             jump = (dx * dx + dy * dy) ** 0.5
             if matched_via_lost or jump > float(settings["wide_margin"]):
-                # Резкий прыжок — это скорее перезахват, чем обычное движение:
-                # не разгоняем рамку по инерции в сторону от цели.
                 velocity = (0.0, 0.0)
             else:
                 vx = 0.5 * velocity[0] + 0.5 * dx
@@ -1505,8 +1398,6 @@ class ScanWorker(threading.Thread):
             last_seen = new_center
             patch = self._patch_at(gray, new_center, tw, th)
 
-            # Обновляем только центр эталона, чтобы новый фон не «впечатался».
-            # Слабые lost-совпадения не трогают эталон.
             update_ok = score >= float(settings["update_score"]) and (
                 not matched_via_lost or score >= 0.90
             )
@@ -1518,8 +1409,6 @@ class ScanWorker(threading.Thread):
                         bank[matched_index - 1], patch
                     )
 
-            # Новый фон/ракурс — добавляем снимок в банк. Так следующие сканы
-            # могут совпасть уже с ним, а не только со старым фоном.
             bank_size = int(settings.get("template_bank_size", 4))
             if (
                 patch is not None
@@ -1539,15 +1428,11 @@ class ScanWorker(threading.Thread):
         else:
             misses += 1
             if lost_mode:
-                # В режиме поиска рамка стоит на последней подтверждённой
-                # позиции, а не уезжает по инерции: ищем «от себя».
                 new_center = last_seen
                 velocity = (0.0, 0.0)
             else:
                 new_center = predicted
                 velocity = (velocity[0] * 0.9, velocity[1] * 0.9)
-                # Не уводим рамку далеко от последней подтверждённой точки:
-                # потерянную цель всё равно ищем в lost_margin от неё.
                 cap = float(settings["wide_margin"])
                 dx = new_center[0] - last_seen[0]
                 dy = new_center[1] - last_seen[1]
@@ -1589,7 +1474,6 @@ class ScanWorker(threading.Thread):
             self._manual_rect = rect
             self._manual_lost_at = lost_at
 
-# ==================== ТЕПЛОВИЗОР (ПОТОК) ====================
 
 class FullViewSnapshot(NamedTuple):
     """Один кадр полного окна Roblox для RADAR_VIEW.
@@ -1660,8 +1544,6 @@ class ThermalWorker(threading.Thread):
         with self._lock:
             self._thermal_active = bool(active)
             if not active:
-                # Не показываем старую тепловую карту, пока воркер не сделает
-                # следующий кадр уже без Q.
                 self._snapshot = self._snapshot._replace(
                     thermal=None, overlay=None
                 )
@@ -1674,8 +1556,6 @@ class ThermalWorker(threading.Thread):
                 self._targets = []
                 self._main = None
                 self._tracker = TargetTracker()
-                # Рамки полного поиска должны исчезнуть сразу, не дожидаясь
-                # следующего кадра; тепловая карта при включённом Q остаётся.
                 self._snapshot = self._snapshot._replace(
                     targets=[], main=None, motion=None
                 )
@@ -1720,7 +1600,6 @@ class ThermalWorker(threading.Thread):
     def snapshot(self) -> FullViewSnapshot:
         with self._lock:
             snap = self._snapshot
-            # Списки отдаём копией: UI читает их из другого потока.
             return snap._replace(targets=list(snap.targets))
 
     def stop(self) -> None:
@@ -1741,16 +1620,12 @@ class ThermalWorker(threading.Thread):
                 snap = self._empty()
                 self._prev = None
             with self._lock:
-                # Режим могли выключить, пока шёл захват/детект. Не отдаём
-                # в UI уже отключённые слои даже на один кадр.
                 if not self._fullscan_active:
                     snap = snap._replace(targets=[], main=None, motion=None)
                 if not self._thermal_active:
                     snap = snap._replace(thermal=None, overlay=None)
                 elif thermal_mode() == "window":
                     snap = snap._replace(overlay=None)
-                # В overlay-режиме thermal BGR остаётся для TV-прицела RMB;
-                # полноэкранный слой берётся из overlay.
                 self._snapshot = snap
 
             delay = 0.05 - (time.perf_counter() - started)
@@ -1763,7 +1638,6 @@ class ThermalWorker(threading.Thread):
             fullscan_on = self._fullscan_active
             profile = dict(self._profile)
         mode = thermal_mode()
-        # BGR-тепло нужно и в overlay-режиме: его показывает TV-прицел по RMB.
         want_window = thermal_on
         want_overlay = thermal_on and mode == "overlay"
 
@@ -1820,8 +1694,6 @@ class ThermalWorker(threading.Thread):
                 self._targets = []
                 self._main = None
 
-        # Сырая карта нужна, когда H включён без тепловизора. Если включён
-        # только Q, показываем тепловую карту и не тратим память на копию.
         motion = diff if fullscan_on else None
         return FullViewSnapshot(
             thermal, overlay, gray, motion, list(targets), main, origin,
@@ -1831,8 +1703,6 @@ class ThermalWorker(threading.Thread):
     @staticmethod
     def _thermal_bg(width: int, height: int) -> np.ndarray:
         """Тёмный фон тепловой карты (цвет BGR)."""
-        # В режиме window bg_alpha задаёт яркость фона RADAR_VIEW, в режиме
-        # overlay — прозрачность затемнения всего экрана.
         bg = max(0, min(80, int(THERMAL_SETTINGS.get("bg_alpha", 140)) // 4))
         return np.full((height, width, 3), bg, dtype=np.uint8)
 
@@ -1871,8 +1741,6 @@ class ThermalWorker(threading.Thread):
         if count:
             hot = cv2.bitwise_and(diff, diff, mask=mask)
             gain = max(1, int(config.get("MOTION_MAP_GAIN", 8)))
-            # Чёрно-белый white-hot: яркость движения идёт в белый, фон
-            # остаётся тёмным. Никаких цветных colormap.
             hot = cv2.convertScaleAbs(hot, alpha=gain, beta=35)
             heat = cv2.cvtColor(hot, cv2.COLOR_GRAY2BGR)
 
@@ -1884,7 +1752,6 @@ class ThermalWorker(threading.Thread):
 
         overlay: Optional[np.ndarray] = None
         if want_overlay:
-            # BGRA: QImage.Format_ARGB32 на Windows читает байты B,G,R,A.
             overlay = np.zeros((height, width, 4), dtype=np.uint8)
             if heat is not None:
                 overlay[mask != 0, :3] = heat[mask != 0]
@@ -1892,7 +1759,6 @@ class ThermalWorker(threading.Thread):
 
         return thermal, overlay, count
 
-# ==================== ОВЕРЛЕЙ РАДАРА ====================
 
 class Overlay(QMainWindow):
     def __init__(self) -> None:
@@ -1925,19 +1791,14 @@ class Overlay(QMainWindow):
         self._center_progress_at = 0.0
         self._center_pause_until = 0.0
         self._center_warned = False
-        # Клавиши A/D/W/S, которые зажал именно макрос (чужие не отпускаем).
         self._center_keys_owned: Dict[str, Tuple[str, Any]] = {}
         self._center_keys_started = 0.0
         self._center_rest_until = 0.0
 
-        # Кэш BGRA-слоя тепловизора для полноэкранного оверлея: QImage
-        # ссылается на numpy-буфер, поэтому храним и сам массив.
         self._thermal_qimage: Optional[QImage] = None
         self._thermal_qimage_key: Optional[Tuple[int, Tuple[int, ...]]] = None
         self._thermal_qimage_data: Optional[np.ndarray] = None
 
-        # Ручной захват (хардлок): помним, было ли слежение V включено до него.
-        # Если захват сам включил V, после снятия/срыва вернём его в OFF.
         self._lock_tracking_before = False
         self._lock_tracking_auto = False
         self._manual_lock_owned = False
@@ -1958,7 +1819,6 @@ class Overlay(QMainWindow):
         self.timer.timeout.connect(self.logic_tick)
         self.timer.start(10)
 
-    # -------- видимость --------
 
     def _radar_view_wanted(self) -> bool:
         """Окно нужно, если оно включено в конфиге или активен полный вид.
@@ -2046,8 +1906,6 @@ class Overlay(QMainWindow):
         width, height = self._radar_last_size
         if width <= 0 or height <= 0:
             return
-        # Переводим координаты клика в базовый кадр SQUARE_SIZE: окно могло
-        # быть растянуто через Z, но кнопка нарисована в координатах кадра.
         fx = x * SQUARE_SIZE / float(width)
         fy = y * SQUARE_SIZE / float(height)
         bx, by, bw, bh = self._ui_button_rect(SQUARE_SIZE)
@@ -2126,7 +1984,6 @@ class Overlay(QMainWindow):
         except Exception:
             pass
 
-    # -------- наведение --------
 
     @staticmethod
     def target_center(rect: Rect) -> Tuple[int, int]:
@@ -2160,7 +2017,7 @@ class Overlay(QMainWindow):
             if not fg:
                 return False
             try:
-                root = win32gui.GetAncestor(fg, 2)  # GA_ROOT
+                root = win32gui.GetAncestor(fg, 2)
                 if root:
                     fg = root
             except Exception:
@@ -2183,8 +2040,6 @@ class Overlay(QMainWindow):
             if self._center_rmb_sent or not center_auto_rmb():
                 return
             try:
-                # Если RMB уже держит пользователь, не вмешиваемся: иначе
-                # отпускание N сломает его физическое удержание.
                 if win32api.GetAsyncKeyState(win32con.VK_RBUTTON) & 0x8000:
                     return
                 win32api.mouse_event(
@@ -2217,8 +2072,6 @@ class Overlay(QMainWindow):
         except ValueError:
             return
         try:
-            # Если клавишу уже держит игрок, не перехватываем её: иначе на
-            # отпускании серии мы оторвём его собственное движение.
             if win32api.GetAsyncKeyState(vk) & 0x8000:
                 return
         except Exception:
@@ -2305,7 +2158,7 @@ class Overlay(QMainWindow):
 
     def _key_center_step(self, ex: int, ey: int, now: float) -> None:
         """Одна серия коррекции удержанием A/D/W/S, не дольше 1 секунды."""
-        self._set_center_rmb(False)  # старый режим RMB больше не используем
+        self._set_center_rmb(False)
         if now < self._center_rest_until:
             self._release_center_keys()
             return
@@ -2372,8 +2225,6 @@ class Overlay(QMainWindow):
             self._reset_center_progress(now)
             return
 
-        # Защита от бесконечной коррекции: если цель не приближается к центру,
-        # значит выбраны не те клавиши или игра не принимает ввод.
         error = math.hypot(ex, ey)
         if error < self._center_best_error - 1.0:
             self._center_best_error = error
@@ -2397,8 +2248,6 @@ class Overlay(QMainWindow):
             self._key_center_step(ex, ey, now)
             return
 
-        # Старый режим (CENTER_USE_KEYS=false): относительное движение мыши.
-        # Оставлен как запасной вариант, по умолчанию выключен.
         self._release_center_keys()
         dx = int(round(ex * CENTER_GAIN))
         dy = int(round(ey * CENTER_GAIN))
@@ -2412,7 +2261,6 @@ class Overlay(QMainWindow):
                 win32con.MOUSEEVENTF_MOVE, dx, dy, 0, 0
             )
         except Exception:
-            # Резерв для сборок pywin32 без mouse_event.
             try:
                 cur_x, cur_y = win32api.GetCursorPos()
                 win32api.SetCursorPos((cur_x + dx, cur_y + dy))
@@ -2435,7 +2283,6 @@ class Overlay(QMainWindow):
         print(f"[aim] center hold {state}")
         self.update()
 
-    # -------- профили --------
 
     def cycle_profile(self) -> None:
         global active_profile
@@ -2453,7 +2300,6 @@ class Overlay(QMainWindow):
         save_config()
         print(f"[profile] {get_profile()['title']}")
 
-    # -------- ручной захват --------
 
     def _nearby_capture_targets(
         self,
@@ -2517,7 +2363,6 @@ class Overlay(QMainWindow):
 
         exact = patch_at(client_cx, client_cy)
         exact_score = self._patch_score(exact[0]) if exact is not None else -1.0
-        # Курсор уже на цели/контрастном объекте — не уводим захват в сторону.
         if exact is not None and float(exact[0].std()) >= 4.0:
             left, top = exact[1], exact[2]
             return exact[0], (left + size / 2.0, top + size / 2.0), (
@@ -2630,8 +2475,6 @@ class Overlay(QMainWindow):
 
         switching = current is not None
         if not switching:
-            # Запоминаем состояние V до захвата: если слежение было
-            # выключено, после снятия/срыва вернём его в OFF.
             self._lock_tracking_before = bool(shared_data["tracking_mode"])
             self._lock_tracking_auto = False
             if keys.pressed(VK_SCAN) and not self._lock_tracking_before:
@@ -2684,7 +2527,6 @@ class Overlay(QMainWindow):
 
         if self._manual_lock_owned and self.scanner.manual_lock_rect() is not None:
             if not self._resize_manual_lock(size):
-                # Не оставляем интерфейс с новым режимом, но старым шаблоном.
                 self.update()
                 print(f"[lock] size mode: {previous.upper()} (не изменён)")
                 return
@@ -2710,7 +2552,6 @@ class Overlay(QMainWindow):
         self._manual_lock_owned = False
         self.update()
 
-    # -------- тепловизор и полный поиск --------
 
     def toggle_thermal(self) -> None:
         if not shared_data["thermal_active"]:
@@ -2726,8 +2567,6 @@ class Overlay(QMainWindow):
             shared_data["thermal_active"] = False
             self.thermal_worker.set_thermal(False)
             self._maybe_close_radar_view()
-            # Настройки тепловизора меняются Num-клавишами; фиксируем их на
-            # диск при выключении, не дожидаясь выхода.
             save_config()
         self.update()
 
@@ -2800,7 +2639,6 @@ class Overlay(QMainWindow):
         if bg_up:
             settings["bg_alpha"] = min(255, settings["bg_alpha"] + 10)
 
-    # -------- горячие клавиши --------
 
     def _poll_hotkeys(self) -> None:
         if keys.just_pressed(VK_EXIT):
@@ -2813,8 +2651,6 @@ class Overlay(QMainWindow):
             return
 
         if keys.just_pressed(VK_TRACK):
-            # V управляет только слежением: ручной захват (LOCK) остаётся,
-            # чтобы его можно было выключить/включить при активном хардлоке.
             shared_data["tracking_mode"] = not shared_data["tracking_mode"]
         if keys.just_pressed(VK_THERMAL):
             self.toggle_thermal()
@@ -2834,7 +2670,6 @@ class Overlay(QMainWindow):
             self.toggle_center_hold()
         self._handle_thermal_hotkeys()
 
-    # -------- главный цикл --------
 
     def logic_tick(self) -> None:
         if self._closing:
@@ -2846,8 +2681,6 @@ class Overlay(QMainWindow):
         active = keys.pressed(VK_SCAN)
         full_active = bool(shared_data["fullscan_active"])
         zoom_hold = keys.pressed(VK_ZOOM_HOLD)
-        # N сам зажимает RMB для обзора камеры. Этот синтетический RMB не
-        # должен включать RMB-линзу, иначе она перекроет полэкрана.
         if self._center_rmb_sent and VK_ZOOM_HOLD == win32con.VK_RBUTTON:
             zoom_hold = False
         thermal_overlay = bool(
@@ -2861,11 +2694,8 @@ class Overlay(QMainWindow):
         shared_data["active"] = active
         shared_data["zoom_hold"] = zoom_hold
         self.scanner.set_active(active)
-        # RMB-прицел может работать без Q/H: воркеру нужен только raw-кадр.
         self.thermal_worker.set_zoom(zoom_hold)
 
-        # Полный вид и поиск живут в отдельном воркере: он захватывает всё
-        # окно Roblox даже при отпущенной F.
         full_snap = self.thermal_worker.snapshot() if (
             shared_data["thermal_active"] or full_active or zoom_hold
         ) else None
@@ -2885,16 +2715,12 @@ class Overlay(QMainWindow):
 
         if active:
             targets, main, motion, lock = self.scanner.snapshot()
-            # Сканер потерял шаблон (цель ушла/перекрыта дольше max_misses):
-            # снимаем хардлок и возвращаем слежение в состояние до захвата.
             if self._manual_lock_owned and not self.scanner.has_manual_lock():
                 self._finish_manual_lock("lost")
                 lock = None
             shared_data["targets"] = targets
             shared_data["main_target"] = main
             shared_data["lock_target"] = lock
-            # Приоритет: ручной LOCK, затем цель курсорного радара, затем
-            # главная цель полного поиска.
             steer = lock if lock is not None else (main if main is not None else full_main)
             if steer is not None:
                 if shared_data["center_hold"]:
@@ -2903,15 +2729,11 @@ class Overlay(QMainWindow):
                 elif shared_data["tracking_mode"]:
                     self.execute_tracking(steer)
         else:
-            # Срыв мог произойти в последнем скане перед отпусканием F —
-            # обрабатываем его и без активного сканирования.
             if self._manual_lock_owned and not self.scanner.has_manual_lock():
                 self._finish_manual_lock("lost")
             targets, main, motion = [], None, None
             shared_data["targets"] = []
             shared_data["main_target"] = None
-            # Захват при отпущенном F не снимается: сканер продолжает искать
-            # шаблон в фоне и обновляет рамку.
             shared_data["lock_target"] = (
                 self.scanner.manual_lock_rect() if self._manual_lock_owned else None
             )
@@ -2925,7 +2747,6 @@ class Overlay(QMainWindow):
                 elif shared_data["tracking_mode"]:
                     self.execute_tracking(steer)
 
-        # Если N выключен или цели нет — не держим клавиши/RMB зажатыми.
         if center_target is None:
             self._release_center_inputs()
             self._center_rest_until = 0.0
@@ -2934,9 +2755,6 @@ class Overlay(QMainWindow):
         self._update_radar_view(targets, motion, active, full_snap)
 
         now = time.perf_counter()
-        # Смена состояния (нажал/отпустил F или H) перерисовывается
-        # принудительно: иначе throttle мог пропустить единственный кадр
-        # очистки, и старые боксы оставались на экране.
         if state_changed or full_state_changed or zoom_state_changed or (
             (
                 active
@@ -2957,7 +2775,6 @@ class Overlay(QMainWindow):
         self._prev_fullscan = full_active
         self._prev_zoom = zoom_hold
 
-    # -------- окно RADAR_VIEW --------
 
     def _update_radar_view(
         self,
@@ -2978,8 +2795,6 @@ class Overlay(QMainWindow):
         )
         full_view = bool(shared_data.get("fullscan_active") or thermal_window)
         if full_view:
-            # В режиме overlay тепловизор уже рисуется поверх экрана, поэтому
-            # мини-окно при H показывает motion map и рамки, без дубля тепла.
             if thermal_mode() == "overlay" and full_snap is not None:
                 full_snap = full_snap._replace(thermal=None)
             frame = self._render_full_view(full_snap)
@@ -2990,8 +2805,6 @@ class Overlay(QMainWindow):
                 gain = int(config.get("MOTION_MAP_GAIN", 8))
                 scaled = motion if gain == 1 else cv2.convertScaleAbs(motion, alpha=gain)
                 if zoom_hold:
-                    # Локальная карта уже центрирована на курсоре: берём
-                    # центральную половину и растягиваем на всё окно.
                     h, w = scaled.shape[:2]
                     ch, cw = max(8, h // 2), max(8, w // 2)
                     scaled = scaled[
@@ -3029,8 +2842,6 @@ class Overlay(QMainWindow):
         self._draw_ui_button(frame)
 
         if self._radar_zoom:
-            # Увеличиваем уже готовый кадр целиком: карта, перекрестие и
-            # подписи растут вместе с окном, пиксели остаются чёткими.
             frame = cv2.resize(
                 frame, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_NEAREST
             )
@@ -3044,8 +2855,6 @@ class Overlay(QMainWindow):
             self._radar_window_created = False
             return
 
-        # FindWindow/SetWindowPos раньше вызывались 60+ раз в секунду; теперь
-        # хендл кэшируется и поднимается не чаще раза в секунду.
         stale_hwnd = self._radar_hwnd is None or not win32gui.IsWindow(self._radar_hwnd)
         if stale_hwnd or now >= self._next_topmost:
             hwnd = win32gui.FindWindow(None, RADAR_WINDOW_TITLE)
@@ -3156,7 +2965,6 @@ class Overlay(QMainWindow):
             if source is not None:
                 zoom_hold = bool(shared_data.get("zoom_hold"))
                 if zoom_hold and snap.size[0] > 0 and snap.size[1] > 0:
-                    # x2 вокруг курсора/цели. Кроп сохраняет пропорции клиента.
                     crop_w = max(32, int(round(source.shape[1] / ZOOM_HOLD_FACTOR)))
                     crop_h = max(32, int(round(source.shape[0] / ZOOM_HOLD_FACTOR)))
                     crop_w = min(crop_w, source.shape[1])
@@ -3354,7 +3162,6 @@ class Overlay(QMainWindow):
                 font_scale, (180, 180, 180), 1,
             )
 
-        # Нижняя подсказка по клавишам.
         hint_panel = frame.copy()
         cv2.rectangle(hint_panel, (0, height - bottom), (width, height), (0, 0, 0), -1)
         cv2.addWeighted(hint_panel, 0.72, frame, 0.28, 0, frame)
@@ -3445,10 +3252,8 @@ class Overlay(QMainWindow):
             Overlay._draw_cv_cross(
                 frame, cx, cy, max(120, SQUARE_SIZE // 2), locked
             )
-            # Как в старом обычном интерфейсе — зелёная точка в центре.
             cv2.circle(frame, (cx, cy), 2, (0, 180, 0), -1)
 
-        # cv2.putText не умеет кириллицу — показываем ключ профиля.
         cv2.putText(
             frame, f"PROFILE [{CV2_BIND_LABELS['profile']}]: {active_profile.upper()}",
             (10, 20), font, 0.45, (0, 220, 255), 1,
@@ -3540,7 +3345,6 @@ class Overlay(QMainWindow):
         target_color = (0, 255, 0) if targets_count else (128, 128, 128)
         cv2.putText(frame, f"TARGETS: {targets_count}", (10, y), font, 0.45, target_color, 1)
 
-    # -------- отрисовка оверлея --------
 
     @staticmethod
     def _tv_anchor() -> Tuple[int, int, bool]:
@@ -3575,9 +3379,6 @@ class Overlay(QMainWindow):
         src_size = max(24, min(src_size, source.shape[1], source.shape[0]))
         px = x - snap.origin[0]
         py = y - snap.origin[1]
-        # Линза всегда остаётся на экране. Crop сдвигаем так, чтобы точка
-        # прицела оказалась ровно под экранным (x, y), даже если линзу
-        # прижало к краю: иначе увеличенная цель уезжает от перекрестия.
         left = max(0, min(self.sw - lens, x - lens // 2))
         top = max(0, min(self.sh - lens, y - lens // 2))
         crop_x0 = int(round(px - (x - left) * src_size / float(lens)))
@@ -3615,8 +3416,6 @@ class Overlay(QMainWindow):
         painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
         painter.drawImage(left, top, image)
 
-        # Рамка и угловые засечки TV-прицела. В обычном интерфейсе
-        # оставляем только тонкую рамку, чтобы не перегружать экран.
         if interface_is_new():
             painter.setPen(QPen(QColor(235, 235, 235, 210), 1))
             painter.drawRect(left, top, lens - 1, lens - 1)
@@ -3647,14 +3446,12 @@ class Overlay(QMainWindow):
         half = outer // 2
         corner = max(18, outer // 10)
 
-        # Внешние угловые скобки.
         for sx, sy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
             px = x + sx * half
             py = y + sy * half
             painter.drawLine(px, py, px - sx * corner, py)
             painter.drawLine(px, py, px, py - sy * corner)
 
-        # Внутренний TV-квадрат.
         inner = max(80, outer // 3)
         ih = inner // 2
         ic = max(10, inner // 5)
@@ -3664,11 +3461,9 @@ class Overlay(QMainWindow):
             painter.drawLine(px, py, px - sx * ic, py)
             painter.drawLine(px, py, px, py - sy * ic)
 
-        # Маленький центральный квадрат.
         box = max(22, outer // 14)
         painter.drawRect(x - box // 2, y - box // 2, box, box)
 
-        # Длинные линии прицела с разрывом в центре.
         span = max(outer, min(900, self.sh // 2))
         gap = 10
         painter.drawLine(x - span, y, x - gap, y)
@@ -3684,8 +3479,6 @@ class Overlay(QMainWindow):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         try:
-            # Прозрачный слой чистим явно каждый раз: при отпускании F не
-            # должны оставаться старые боксы, но LOCK/прицел остаются видимыми.
             painter.setCompositionMode(QPainter.CompositionMode_Source)
             painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
             if self.is_hidden:
@@ -3705,8 +3498,6 @@ class Overlay(QMainWindow):
                 else None
             )
 
-            # Режим overlay: затемняем весь экран и рисуем только горячие
-            # пиксели чёрно-белой тепловой карты поверх окна Roblox.
             if thermal_overlay and snap is not None:
                 painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
                 painter.fillRect(
@@ -3717,7 +3508,6 @@ class Overlay(QMainWindow):
                     key = (id(snap.overlay), snap.overlay.shape)
                     if key != self._thermal_qimage_key:
                         height, width = snap.overlay.shape[:2]
-                        # QImage не копирует буфер — держим numpy-массив живым.
                         self._thermal_qimage_data = snap.overlay
                         self._thermal_qimage = QImage(
                             snap.overlay.data,
@@ -3770,7 +3560,6 @@ class Overlay(QMainWindow):
 
             painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
 
-            # Обычный интерфейс: старый зелёный круг радара вокруг курсора.
             if not ui_new and (active or lock is not None or full):
                 mx, my = win32api.GetCursorPos()
                 half = SQUARE_SIZE // 2
@@ -3779,9 +3568,6 @@ class Overlay(QMainWindow):
                     mx - half, my - half, SQUARE_SIZE, SQUARE_SIZE
                 )
 
-            # Полноэкранный поиск рисует рамки по всему клиенту Roblox и
-            # работает независимо от F и Q. Линии идут от курсора/цели,
-            # а не от центра экрана.
             if full:
                 for rect in shared_data["full_targets"]:
                     rx, ry, rw, rh = rect
@@ -3803,8 +3589,6 @@ class Overlay(QMainWindow):
             if active:
                 for rect in shared_data["targets"]:
                     rx, ry, rw, rh = rect
-                    # При ручном захвате радарные блобы вторичны: не подсвечиваем
-                    # «главную» цель красным, чтобы трассер не выглядел захваченным.
                     is_main = (not locked) and rect == shared_data["main_target"]
                     color = QColor(255, 0, 0) if is_main else QColor(255, 140, 0)
                     painter.setPen(QPen(color, 2 if is_main else 1))
@@ -3822,14 +3606,9 @@ class Overlay(QMainWindow):
                 painter.setFont(QFont("Consolas", 8, QFont.Bold))
                 painter.drawText(lx, max(12, ly - 4), "LOCK")
 
-            # Цифровой x2 прицел по RMB: вокруг цели после LOCK, иначе
-            # вокруг курсора. Источник — тепло (Q) или сырой grayscale-кадр.
-            # Рисуем поверх рамок, чтобы внутри линзы не было старых боксов.
             if zoom_hold and snap is not None:
                 self._draw_zoom_scope(painter, snap, anchor_x, anchor_y)
 
-            # TV-прицел поверх всего: до захвата от курсора, после — от цели.
-            # В обычном интерфейсе остаётся системный курсор, без TV-обвязки.
             if ui_new:
                 self._draw_tv_reticle(painter, anchor_x, anchor_y, locked)
 
@@ -3844,7 +3623,6 @@ class Overlay(QMainWindow):
         finally:
             painter.end()
 
-    # -------- завершение --------
 
     def shutdown(self) -> None:
         if self._closing:
@@ -3867,7 +3645,6 @@ class Overlay(QMainWindow):
             if app is not None:
                 app.quit()
 
-# ==================== ЗАПУСК ====================
 
 def main() -> None:
     app = QApplication(sys.argv)

@@ -186,3 +186,24 @@
 - в RADAR_VIEW и полном виде показывается текущий SIZE [X] режим и размер
 - версия beta-3.7
 
+01.11.2026 (bind settings)
+- добавлен bind_settings.py: отдельное окно для настройки BINDS без ручного
+  редактирования config.json
+- бинд назначается нажатием нужной клавиши или кнопки мыши (LMB, RMB, MMB,
+  XBUTTON1, XBUTTON2); остальные настройки конфига сохраняются
+- проверка повторяющихся биндов, сброс на значения по умолчанию, предупреждение
+  о перезапуске RADAR Macro после сохранения
+
+01.11.2026 (bind settings: параметры)
+- окно разделено на вкладки: Бинды, Корректировка, Основные, Поиск, LOCK,
+  Тепловизор; редактируются не только BINDS, но и остальные параметры конфига
+- Корректировка: CENTER_USE_KEYS, CENTER_KEY_LEFT/RIGHT/UP/DOWN (по умолчанию
+  A/D/W/S), CENTER_HOLD_SECONDS, CENTER_REST_SECONDS и CENTER_AUTO_RMB
+- Основные: SQUARE_SIZE, SCAN_INTERVAL, SHOW_RADAR_VIEW, MOTION_MAP_GAIN,
+  INTERFACE_MODE, LOCK_SIZE_MODE, THERMAL_MODE и ACTIVE_PROFILE
+- Поиск: параметры профилей SEARCH_PROFILES с переключением профиля; LOCK:
+  все поля LOCK_SETTINGS; Тепловизор: THERMAL_SETTINGS и THERMAL_WINDOWS
+- проверка повторов клавиш среди BINDS и CENTER_KEY_*, совместимости размеров
+  LOCK и max_area/min_area профилей; неизвестные ключи, профили и BINDS
+  сохраняются без изменений
+

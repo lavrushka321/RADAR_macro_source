@@ -108,7 +108,7 @@ python bind_settings.py
 | `CENTER_*` | Коррекция цели в центре: клавиши, тайминги, режим |
 | `SEARCH_PROFILES`, `ACTIVE_PROFILE` | Профили поиска и активный профиль |
 | `LOCK_SETTINGS`, `LOCK_SIZE_MODE` | Параметры и размер хардлока |
-| `THERMAL_SETTINGS`, `THERMAL_MODE`, `THERMAL_WINDOWS` | Тепловизор |
+| `THERMAL_SETTINGS`, `THERMAL_MODE`, `THERMAL_WINDOWS` | Тепловизор: порог, частота, режим, окна |
 | `SQUARE_SIZE`, `SCAN_INTERVAL`, `SHOW_RADAR_VIEW` | Общие параметры сканирования |
 | `MOTION_MAP_GAIN` | Усиление карты движения в `RADAR_VIEW` |
 | `INTERFACE_MODE` | `new` (TV-интерфейс) или `normal` |
@@ -172,6 +172,10 @@ python bind_settings.py
 
 Изменения сохраняются при выключении тепловизора.
 
+Частота обновления задаётся в `THERMAL_SETTINGS.fps` (10–60, по умолчанию
+30 FPS) и меняется на вкладке `Тепловизор` в `bind_settings.py`. Более высокий
+FPS даёт плавнее картинку, но сильнее нагружает CPU.
+
 ## Файлы
 
 - `main.py` — основной макрос: захват, поиск, `RADAR_VIEW`, `LOCK`, тепловизор.
@@ -188,7 +192,7 @@ python bind_settings.py
 - Конфиг читается при старте. После `Сохранить` в `bind_settings.py` закройте
   и снова запустите `main.py`.
 - Неизвестные ключи и дополнительные профили не удаляются.
-- Версия: **beta-3.7**.
+- Версия: **beta-3.8**.
 
 ## Лицензия
 

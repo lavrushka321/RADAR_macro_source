@@ -35,7 +35,7 @@ from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PyQt5.QtWidgets import QApplication, QMainWindow
 
 
-__version__ = "beta-3.7 (max)"
+__version__ = "beta-3.8 (max)"
 
 RADAR_WINDOW_TITLE = "RADAR_VIEW"
 
@@ -57,7 +57,7 @@ enable_dpi_awareness()
 CONFIG_DIR = Path.home() / ".radar_macro"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "CONFIG_VERSION": CONFIG_VERSION,
@@ -135,6 +135,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "sample_step": 1,
         "bg_alpha": 140,
         "max_dots": 20000,
+        "fps": 30,
     },
     "THERMAL_MODE": "window",
     "BINDS": {
@@ -350,6 +351,7 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
     thermal["sample_step"] = _as_int(thermal.get("sample_step"), 1, 1, 12)
     thermal["bg_alpha"] = _as_int(thermal.get("bg_alpha"), 140, 0, 255)
     thermal["max_dots"] = _as_int(thermal.get("max_dots"), 20000, 1000, 50000)
+    thermal["fps"] = _as_int(thermal.get("fps"), 30, 10, 60)
 
     thermal_mode_value = str(cfg.get("THERMAL_MODE", "window")).strip().lower()
     if thermal_mode_value not in ("window", "overlay"):
@@ -534,6 +536,15 @@ def thermal_mode() -> str:
     """Текущее место показа тепловизора: window или overlay."""
     mode = str(config.get("THERMAL_MODE", "window")).strip().lower()
     return mode if mode in ("window", "overlay") else "window"
+
+
+def thermal_interval() -> float:
+    """Интервал обновления тепловизора из THERMAL_SETTINGS.fps."""
+    try:
+        fps = int(THERMAL_SETTINGS.get("fps", 30))
+    except (TypeError, ValueError):
+        fps = 30
+    return 1.0 / max(10, min(60, fps))
 
 
 def interface_is_new() -> bool:
@@ -1628,7 +1639,7 @@ class ThermalWorker(threading.Thread):
                     snap = snap._replace(overlay=None)
                 self._snapshot = snap
 
-            delay = 0.05 - (time.perf_counter() - started)
+            delay = thermal_interval() - (time.perf_counter() - started)
             if delay > 0:
                 self._stop_evt.wait(delay)
 
@@ -1636,9 +1647,10 @@ class ThermalWorker(threading.Thread):
         with self._lock:
             thermal_on = self._thermal_active
             fullscan_on = self._fullscan_active
+            zoom_on = self._zoom_active
             profile = dict(self._profile)
         mode = thermal_mode()
-        want_window = thermal_on
+        want_window = thermal_on and (mode == "window" or zoom_on)
         want_overlay = thermal_on and mode == "overlay"
 
         captured = capture_roblox_window()
@@ -1717,7 +1729,8 @@ class ThermalWorker(threading.Thread):
         ``want_window`` — BGR-карта для RADAR_VIEW и TV-прицела,
         ``want_overlay`` — BGRA-слой для полноэкранного оверлея (фон
         прозрачный). Порог, шаг выборки и размер точки берутся из
-        THERMAL_SETTINGS.
+        THERMAL_SETTINGS. Горячие пиксели копируются через ``cv2.copyTo``:
+        это заметно быстрее булевой маски и не требует лишних копий кадра.
         """
         height, width = diff.shape
         _, mask = cv2.threshold(
@@ -1737,25 +1750,25 @@ class ThermalWorker(threading.Thread):
             )
 
         count = int(cv2.countNonZero(mask))
-        heat: Optional[np.ndarray] = None
-        if count:
-            hot = cv2.bitwise_and(diff, diff, mask=mask)
-            gain = max(1, int(config.get("MOTION_MAP_GAIN", 8)))
-            hot = cv2.convertScaleAbs(hot, alpha=gain, beta=35)
-            heat = cv2.cvtColor(hot, cv2.COLOR_GRAY2BGR)
-
         thermal: Optional[np.ndarray] = None
+        overlay: Optional[np.ndarray] = None
+        if not count:
+            if want_window:
+                thermal = ThermalWorker._thermal_bg(width, height)
+            if want_overlay:
+                overlay = np.zeros((height, width, 4), dtype=np.uint8)
+            return thermal, overlay, 0
+
+        gain = max(1, int(config.get("MOTION_MAP_GAIN", 8)))
+        hot = cv2.convertScaleAbs(diff, alpha=gain, beta=35)
         if want_window:
             thermal = ThermalWorker._thermal_bg(width, height)
-            if heat is not None:
-                thermal[mask != 0] = heat[mask != 0]
-
-        overlay: Optional[np.ndarray] = None
+            heat = cv2.cvtColor(hot, cv2.COLOR_GRAY2BGR)
+            cv2.copyTo(heat, mask, thermal)
         if want_overlay:
             overlay = np.zeros((height, width, 4), dtype=np.uint8)
-            if heat is not None:
-                overlay[mask != 0, :3] = heat[mask != 0]
-                overlay[mask != 0, 3] = 255
+            heat = cv2.cvtColor(hot, cv2.COLOR_GRAY2BGRA)
+            cv2.copyTo(heat, mask, overlay)
 
         return thermal, overlay, count
 
@@ -2769,7 +2782,11 @@ class Overlay(QMainWindow):
             )
             and now >= self._next_paint
         ):
-            self._next_paint = now + 0.033
+            self._next_paint = now + (
+                thermal_interval()
+                if (thermal_overlay or full_active or zoom_hold)
+                else 0.033
+            )
             self.update()
         self._prev_active = active
         self._prev_fullscan = full_active
@@ -2786,14 +2803,14 @@ class Overlay(QMainWindow):
         if not self._ensure_radar_view():
             return
         now = time.perf_counter()
-        if now < self._next_view:
-            return
-        self._next_view = now + 0.05
-
         thermal_window = bool(
             shared_data.get("thermal_active") and thermal_mode() == "window"
         )
         full_view = bool(shared_data.get("fullscan_active") or thermal_window)
+        if now < self._next_view:
+            return
+        self._next_view = now + (thermal_interval() if full_view else 0.05)
+
         if full_view:
             if thermal_mode() == "overlay" and full_snap is not None:
                 full_snap = full_snap._replace(thermal=None)

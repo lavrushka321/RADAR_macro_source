@@ -1,0 +1,47 @@
+# Python
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+build/
+dist/
+*.egg-info/
+*.spec
+
+# Виртуальные окружения
+
+.venv/
+venv/
+env/
+
+# Кэш тестов и инструментов
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE
+
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Windows / macOS
+
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Локальные файлы
+
+config.json
+config.json.bad
+*.log
+*.tmp
+*.bak

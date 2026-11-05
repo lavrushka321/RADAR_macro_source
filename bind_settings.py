@@ -143,12 +143,13 @@ DEFAULT_THERMAL: Dict[str, Any] = {
     "sample_step": 1,
     "bg_alpha": 140,
     "max_dots": 20000,
+    "fps": 30,
 }
 
 DEFAULT_THERMAL_WINDOWS: List[str] = ["Roblox", "Roblox Player", "ROBLOX"]
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "CONFIG_VERSION": 4,
+    "CONFIG_VERSION": 5,
     "SQUARE_SIZE": 400,
     "SCAN_INTERVAL": 0.05,
     "SHOW_RADAR_VIEW": True,
@@ -964,11 +965,22 @@ class BindSettingsWindow(QMainWindow):
             ("sample_step", "Шаг выборки", 1, 12, 1),
             ("bg_alpha", "Прозрачность фона", 0, 255, 5),
             ("max_dots", "Макс. точек", 1000, 50000, 1000),
+            ("fps", "Частота обновления", 10, 60, 5),
         ):
             self._make_int(
                 form, self._thermal_widgets, key, label, thermal.get(key),
                 low, high, step,
             )
+        fps_widget = self._thermal_widgets.get("fps")
+        if isinstance(fps_widget, QSpinBox):
+            fps_widget.setSuffix(" FPS")
+
+        note = QLabel(
+            "Частота обновления: 30 FPS — плавнее стандартных 20, "
+            "60 FPS — максимум и заметно больше нагрузки."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
 
         layout.addWidget(QLabel("Окна Roblox (по одному названию в строке):"))
         self._thermal_windows_edit = QPlainTextEdit()

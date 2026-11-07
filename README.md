@@ -5,6 +5,11 @@
 `RADAR_VIEW` либо поверх игры. В процесс Roblox не внедряется и файлы игры не
 меняет.
 
+![](https://github.com/lavrushka321/RADAR_macro_source/blob/main/imgs/6_mtc_F_in_air.png)
+![](https://github.com/lavrushka321/RADAR_macro_source/blob/main/imgs/6_mtc_F.png)
+![](https://github.com/lavrushka321/RADAR_macro_source/blob/main/imgs/6_mtc_Q.png)
+![](https://github.com/lavrushka321/RADAR_macro_source/blob/main/imgs/6_mtc_H.png)
+
 ## Запуск
 
 Требования: Windows 10/11, Python 3.11+, запущенный Roblox в оконном или
